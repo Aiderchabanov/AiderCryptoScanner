@@ -65,8 +65,36 @@ def loop():
 
 @app.get('/')
 def home(): return {'status':'ok','scanner':'Bybit-MEXC','threshold_pct':THRESH}
+def telegram_updates():
+    offset = 0
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=35
+            ).json()
 
-if __name__=='__main__':
+            for update in r.get("result", []):
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                text = message.get("text", "")
+                chat_id = message.get("chat", {}).get("id")
+
+                if text == "/start" and chat_id:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": "✅ Aider Crypto Scanner запущен.\nСканер Bybit ↔ MEXC работает."
+                        },
+                        timeout=10
+                    )
+        except Exception:
+            logging.exception("telegram updates failed")
+            time.sleep(5)
+if __name__ == '__main__':
     import threading
-    threading.Thread(target=loop,daemon=True).start()
-    app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
+    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=telegram_updates, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))
