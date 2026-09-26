@@ -138,14 +138,21 @@ def log_webhook_owner():
     try:
         response = requests.get(f'https://api.telegram.org/bot{TOKEN}/getWebhookInfo', timeout=10)
         data = response.json() if response.status_code == 200 else {}
+        if not data.get('ok'):
+            logging.error('Telegram webhook check failed: HTTP %s', response.status_code)
+            return False
         url = data.get('result', {}).get('url', '')
         logging.info('Telegram webhook host: %s', urlparse(url).hostname or 'none')
+        return not bool(url)
     except Exception as exc:
         logging.error('Telegram webhook check failed: %s', type(exc).__name__)
+        return False
 
 if __name__ == '__main__':
-    log_webhook_owner()
     import threading
     threading.Thread(target=loop, daemon=True).start()
-    threading.Thread(target=telegram_updates, daemon=True).start()
+    if log_webhook_owner():
+        threading.Thread(target=telegram_updates, daemon=True).start()
+    else:
+        logging.warning('Telegram polling disabled: existing webhook or token problem')
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))
