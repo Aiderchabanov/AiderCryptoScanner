@@ -82,8 +82,13 @@ def scan_once():
     return found
 
 def loop():
+    first_success = True
     while True:
-        try: scan_once()
+        try:
+            found = scan_once()
+            if first_success:
+                logging.info('scan succeeded: %s opportunities', len(found))
+                first_success = False
         except Exception: logging.exception('scan failed')
         time.sleep(SCAN)
 
