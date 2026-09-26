@@ -1,5 +1,6 @@
 import os, time, logging, requests
 from flask import Flask
+from urllib.parse import urlparse
 
 BYBIT='https://api.bybit.com/v5/market/tickers?category=spot'
 MEXC='https://api.mexc.com/api/v3/ticker/bookTicker'
@@ -130,7 +131,20 @@ def telegram_updates():
         except Exception as exc:
             logging.error("telegram updates failed: %s", type(exc).__name__)
             time.sleep(5)
+def log_webhook_owner():
+    if not TOKEN:
+        logging.error('TELEGRAM_BOT_TOKEN is missing')
+        return
+    try:
+        response = requests.get(f'https://api.telegram.org/bot{TOKEN}/getWebhookInfo', timeout=10)
+        data = response.json() if response.status_code == 200 else {}
+        url = data.get('result', {}).get('url', '')
+        logging.info('Telegram webhook host: %s', urlparse(url).hostname or 'none')
+    except Exception as exc:
+        logging.error('Telegram webhook check failed: %s', type(exc).__name__)
+
 if __name__ == '__main__':
+    log_webhook_owner()
     import threading
     threading.Thread(target=loop, daemon=True).start()
     threading.Thread(target=telegram_updates, daemon=True).start()
