@@ -20,9 +20,30 @@ def f(x):
     try: return float(x)
     except: return 0.0
 
+def market_json(url):
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(f'Market API returned invalid JSON ({response.status_code}, {response.headers.get("Content-Type", "unknown")})') from exc
+
 def fetch():
-    b=requests.get(BYBIT,timeout=10).json()['result']['list']
-    m=requests.get(MEXC,timeout=10).json()
+    last_error = None
+    for url in (BYBIT, BYBIT.replace('api.bybit.com', 'api.bytick.com')):
+        try:
+            payload = market_json(url)
+            if payload.get('retCode') != 0 or not isinstance(payload.get('result', {}).get('list'), list):
+                raise RuntimeError(f'Bybit API error: {payload.get("retMsg", "invalid ticker data")}')
+            b = payload['result']['list']
+            break
+        except (requests.RequestException, ValueError, RuntimeError, AttributeError) as exc:
+            last_error = exc
+    else:
+        raise RuntimeError('Bybit market data unavailable') from last_error
+    m = market_json(MEXC)
+    if not isinstance(m, list):
+        raise RuntimeError('MEXC returned invalid ticker data')
     bd={x['symbol']:x for x in b if x['symbol'].endswith('USDT')}
     md={x['symbol']:x for x in m if x['symbol'].endswith('USDT')}
     return bd,md
@@ -69,27 +90,35 @@ def telegram_updates():
     offset = 0
     while True:
         try:
-            r = requests.get(
+            response = requests.get(
                 f"https://api.telegram.org/bot{TOKEN}/getUpdates",
                 params={"timeout": 30, "offset": offset},
                 timeout=35
-            ).json()
+            )
+            response.raise_for_status()
+            r = response.json()
+            if not r.get("ok"):
+                raise RuntimeError(f'Telegram getUpdates failed: {r.get("description", "unknown error")}')
 
             for update in r.get("result", []):
-                offset = update["update_id"] + 1
                 message = update.get("message", {})
                 text = message.get("text", "")
                 chat_id = message.get("chat", {}).get("id")
 
-                if text == "/start" and chat_id:
-                    requests.post(
+                if text and text.split(maxsplit=1)[0].split('@')[0] == "/start" and chat_id:
+                    reply = requests.post(
                         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                         json={
                             "chat_id": chat_id,
-                            "text": "✅ Aider Crypto Scanner запущен.\nСканер Bybit ↔ MEXC работает."
+                            "text": "✅ Aider Crypto Scanner запущен.\nСканер Bybit ↔ MEXC проверяет рынок."
                         },
                         timeout=10
                     )
+                    reply.raise_for_status()
+                    if not reply.json().get("ok"):
+                        raise RuntimeError('Telegram sendMessage failed')
+                    logging.info('Telegram /start answered')
+                offset = update["update_id"] + 1
         except Exception:
             logging.exception("telegram updates failed")
             time.sleep(5)
