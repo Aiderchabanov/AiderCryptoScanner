@@ -50,7 +50,9 @@ def fetch():
 
 def telegram(msg):
     if not TOKEN or not CHAT_ID: return
-    requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',json={'chat_id':CHAT_ID,'text':msg},timeout=10).raise_for_status()
+    response = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',json={'chat_id':CHAT_ID,'text':msg},timeout=10)
+    if response.status_code != 200 or not response.json().get('ok'):
+        raise RuntimeError(f'Telegram sendMessage HTTP {response.status_code}')
 
 def candidate(symbol,buy_exchange,buy_ask,buy_qty,sell_exchange,sell_bid,sell_qty,buy_fee,sell_fee):
     if buy_ask<=0 or sell_bid<=0: return None
@@ -95,7 +97,14 @@ def telegram_updates():
                 params={"timeout": 30, "offset": offset},
                 timeout=35
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                try:
+                    detail = response.json().get('description', 'unknown error')
+                except ValueError:
+                    detail = 'non-JSON response'
+                logging.error('Telegram getUpdates HTTP %s: %s', response.status_code, detail)
+                time.sleep(15)
+                continue
             r = response.json()
             if not r.get("ok"):
                 raise RuntimeError(f'Telegram getUpdates failed: {r.get("description", "unknown error")}')
@@ -114,13 +123,12 @@ def telegram_updates():
                         },
                         timeout=10
                     )
-                    reply.raise_for_status()
-                    if not reply.json().get("ok"):
+                    if reply.status_code != 200 or not reply.json().get("ok"):
                         raise RuntimeError('Telegram sendMessage failed')
                     logging.info('Telegram /start answered')
                 offset = update["update_id"] + 1
-        except Exception:
-            logging.exception("telegram updates failed")
+        except Exception as exc:
+            logging.error("telegram updates failed: %s", type(exc).__name__)
             time.sleep(5)
 if __name__ == '__main__':
     import threading
