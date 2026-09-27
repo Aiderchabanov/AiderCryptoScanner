@@ -1,0 +1,17 @@
+name: Wake EU crypto scanner
+
+on:
+  schedule:
+    - cron: "*/12 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Request scanner URL
+        run: curl --fail --location --silent --show-error --max-time 180 https://crypto-spread-scanner-eu.onrender.com/
