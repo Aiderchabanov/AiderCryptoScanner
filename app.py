@@ -226,8 +226,11 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
     coin = symbol[:-4]
     asks, _ = orderbook(buy, symbol)
     _, bids = orderbook(sell, symbol)
-    if not asks or not bids or dec(asks[0][0]) != top_ask or dec(bids[0][0]) != top_bid:
-        return None  # tickers and orderbooks are already inconsistent
+    if not asks or not bids:
+        return None
+    top_ask, top_bid = dec(asks[0][0]), dec(bids[0][0])
+    if not top_ask or not top_bid or top_ask <= 0 or (top_bid / top_ask - 1) * 100 < THRESH:
+        return None  # Recheck the actual orderbooks after the ticker shortlist.
     base = buy_for_usdt(asks, TRADE)
     if base is None:
         return None
@@ -330,7 +333,8 @@ def telegram_updates():
             for update in payload.get('result', []):
                 message = update.get('message', {})
                 chat_id = message.get('chat', {}).get('id')
-                if message.get('text', '').split(maxsplit=1)[0].split('@')[0] == '/start' and chat_id:
+                command = message.get('text', '').split(maxsplit=1)
+                if command and command[0].split('@')[0] == '/start' and chat_id:
                     telegram('✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ 0,5% по Bybit ↔ MEXC.', chat_id)
                     logging.info('Telegram /start answered')
                 offset = update['update_id'] + 1
