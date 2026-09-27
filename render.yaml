@@ -6,14 +6,24 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
-      - key: MIN_SPREAD_PCT
-        value: "2.0"
+      - key: MIN_NET_PROFIT_PCT
+        value: "0.5"
       - key: TRADE_USDT
         value: "1000"
       - key: SCAN_INTERVAL_SEC
         value: "20"
-      - key: MIN_TOP_BOOK_USDT
-        value: "1000"
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: KUCOIN_API_KEY
+        sync: false
+      - key: KUCOIN_API_SECRET
+        sync: false
+      - key: KUCOIN_API_PASSPHRASE
+        sync: false
+      - key: KUCOIN_API_KEY_VERSION
+        value: "2"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

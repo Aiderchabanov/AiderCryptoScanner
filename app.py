@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import base64
 import logging
 import os
 import threading
@@ -10,14 +11,16 @@ from urllib.parse import urlencode, urlparse
 import requests
 from flask import Flask
 
-BYBIT = 'https://api.bybit.com'
-MEXC = 'https://api.mexc.com'
+BINANCE = 'https://api.binance.com'
+KUCOIN = 'https://api.kucoin.com'
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-BYBIT_KEY = os.getenv('BYBIT_API_KEY', '')
-BYBIT_SECRET = os.getenv('BYBIT_API_SECRET', '')
-MEXC_KEY = os.getenv('MEXC_API_KEY', '')
-MEXC_SECRET = os.getenv('MEXC_API_SECRET', '')
+BINANCE_KEY = os.getenv('BINANCE_API_KEY', '')
+BINANCE_SECRET = os.getenv('BINANCE_API_SECRET', '')
+KUCOIN_KEY = os.getenv('KUCOIN_API_KEY', '')
+KUCOIN_SECRET = os.getenv('KUCOIN_API_SECRET', '')
+KUCOIN_PASSPHRASE = os.getenv('KUCOIN_API_PASSPHRASE', '')
+KUCOIN_KEY_VERSION = os.getenv('KUCOIN_API_KEY_VERSION', '2')
 THRESH = Decimal(os.getenv('MIN_NET_PROFIT_PCT', '0.5'))
 TRADE = Decimal(os.getenv('TRADE_USDT', '1000'))
 COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SEC', '1800'))
@@ -57,54 +60,52 @@ def cached(key, ttl, loader):
     return value
 
 
-def bybit(path, params=None, signed=False):
-    query = urlencode(params or {})
-    headers = {}
-    if signed:
-        if not BYBIT_KEY or not BYBIT_SECRET:
-            raise RuntimeError('Bybit read-only API credentials missing')
-        timestamp = str(int(time.time() * 1000))
-        window = '5000'
-        signature = hmac.new(BYBIT_SECRET.encode(), (timestamp + BYBIT_KEY + window + query).encode(), hashlib.sha256).hexdigest()
-        headers = {'X-BAPI-API-KEY': BYBIT_KEY, 'X-BAPI-TIMESTAMP': timestamp,
-                   'X-BAPI-RECV-WINDOW': window, 'X-BAPI-SIGN': signature}
-    # Never log headers, query signatures, or raw server responses.
-    payload = get_json(BYBIT + path, params=params, headers=headers)
-    if payload.get('retCode') != 0:
-        raise RuntimeError('Bybit API rejected request')
-    return payload['result']
-
-
-def mexc(path, params=None, signed=False):
+def binance(path, params=None, signed=False):
     params = dict(params or {})
     headers = {}
     if signed:
-        if not MEXC_KEY or not MEXC_SECRET:
-            raise RuntimeError('MEXC read-only API credentials missing')
+        if not BINANCE_KEY or not BINANCE_SECRET:
+            raise RuntimeError('Binance read-only credentials missing')
         params['timestamp'] = int(time.time() * 1000)
+        params['recvWindow'] = 5000
         query = urlencode(params)
-        params['signature'] = hmac.new(MEXC_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-        headers['X-MEXC-APIKEY'] = MEXC_KEY
-    payload = get_json(MEXC + path, params=params, headers=headers)
-    if signed and isinstance(payload, dict) and payload.get('code', 0) not in (0, 200):
-        raise RuntimeError('MEXC API rejected request')
+        params['signature'] = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        headers['X-MBX-APIKEY'] = BINANCE_KEY
+    payload = get_json(BINANCE + path, params=params, headers=headers)
+    if isinstance(payload, dict) and 'code' in payload and int(payload['code']) < 0:
+        raise RuntimeError('Binance API rejected request')
     return payload
 
 
+def kucoin(path, params=None, signed=False):
+    query = urlencode(params or {})
+    headers = {}
+    if signed:
+        if not all((KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE)):
+            raise RuntimeError('KuCoin read-only credentials missing')
+        timestamp = str(int(time.time() * 1000))
+        def sign(value):
+            digest = hmac.new(KUCOIN_SECRET.encode(), value.encode(), hashlib.sha256).digest()
+            return base64.b64encode(digest).decode()
+        headers = {'KC-API-KEY': KUCOIN_KEY,
+                   'KC-API-SIGN': sign(timestamp + 'GET' + path + ('?' + query if query else '')),
+                   'KC-API-TIMESTAMP': timestamp,
+                   'KC-API-PASSPHRASE': sign(KUCOIN_PASSPHRASE),
+                   'KC-API-KEY-VERSION': KUCOIN_KEY_VERSION}
+    payload = get_json(KUCOIN + path, params=params, headers=headers)
+    if not isinstance(payload, dict) or payload.get('code') != '200000':
+        raise RuntimeError('KuCoin API rejected request')
+    return payload['data']
+
+
 def tickers():
-    try:
-        b = bybit('/v5/market/tickers', {'category': 'spot'})['list']
-    except (requests.RequestException, RuntimeError):
-        # Preserve the public market-data fallback used by the existing service.
-        payload = get_json('https://api.bytick.com/v5/market/tickers', params={'category': 'spot'})
-        if payload.get('retCode') != 0:
-            raise RuntimeError('Bybit market data unavailable')
-        b = payload['result']['list']
-    m = mexc('/api/v3/ticker/bookTicker')
-    if not isinstance(b, list) or not isinstance(m, list):
+    b = binance('/api/v3/ticker/bookTicker')
+    k = kucoin('/api/v1/market/allTickers')['ticker']
+    if not isinstance(b, list) or not isinstance(k, list):
         raise RuntimeError('Invalid market ticker data')
     return ({x['symbol']: x for x in b if x.get('symbol', '').endswith('USDT')},
-            {x['symbol']: x for x in m if x.get('symbol', '').endswith('USDT')})
+            {x['symbol'].replace('-', ''): x for x in k
+             if x.get('symbol', '').endswith('-USDT')})
 
 
 def telegram(msg, chat_id=None):
@@ -118,14 +119,15 @@ def telegram(msg, chat_id=None):
 
 def fee(exchange, symbol):
     def load():
-        if exchange == 'Bybit':
-            rows = bybit('/v5/account/fee-rate', {'category': 'spot', 'symbol': symbol}, True)['list']
+        if exchange == 'Binance':
+            rows = binance('/sapi/v1/asset/tradeFee', {'symbol': symbol}, True)
             row = next((x for x in rows if x.get('symbol') == symbol), None)
-            value = row and positive(row.get('takerFeeRate'))
-        else:
-            data = mexc('/api/v3/tradeFee', {'symbol': symbol}, True)
-            row = data.get('data') if isinstance(data, dict) else None
             value = row and positive(row.get('takerCommission'))
+        else:
+            pair = symbol[:-4] + '-USDT'
+            rows = kucoin('/api/v1/trade-fees', {'symbols': pair}, True)
+            row = next((x for x in rows if x.get('symbol') == pair), None)
+            value = row and positive(row.get('takerFeeRate'))
         if value is None or value >= 1:
             raise RuntimeError('Trading fee unavailable')
         return value
@@ -133,64 +135,73 @@ def fee(exchange, symbol):
 
 
 def networks(exchange, coin):
-    if exchange == 'Bybit':
-        def load():
-            rows = bybit('/v5/asset/coin/query-info', {'coin': coin}, True)['rows']
-            row = next((x for x in rows if x.get('coin') == coin), None)
-            return row.get('chains', []) if row else []
-        return cached(('chain', exchange, coin), 300, load)
-
+    if exchange == 'KuCoin':
+        return cached(('chains', exchange, coin), 300,
+                      lambda: kucoin('/api/v3/currencies/' + coin).get('chains', []))
     def load_all():
-        rows = mexc('/api/v3/capital/config/getall', signed=True)
+        rows = binance('/sapi/v1/capital/config/getall', signed=True)
         if not isinstance(rows, list):
-            raise RuntimeError('MEXC chain data unavailable')
+            raise RuntimeError('Binance chain data unavailable')
         return {x['coin']: x.get('networkList', []) for x in rows if 'coin' in x}
-    return cached(('chains', 'MEXC'), 300, load_all).get(coin, [])
+    return cached(('chains', 'Binance'), 300, load_all).get(coin, [])
 
 
 def chain_id(chain):
-    raw = str(chain or '').upper().replace(' ', '')
+    raw = str(chain or '').upper().replace(' ', '').replace('-', '')
     aliases = {'ERC20': 'ETH', 'ETHEREUM': 'ETH', 'TRC20': 'TRX', 'TRON': 'TRX',
-               'BEP20(BSC)': 'BSC', 'BEP20': 'BSC', 'SOLANA': 'SOL',
-               'MATIC': 'POLYGON'}
+               'BEP20(BSC)': 'BSC', 'BEP20': 'BSC', 'BNBSMARTCHAIN': 'BSC',
+               'SOLANA': 'SOL', 'MATIC': 'POLYGON', 'POLYGONPOS': 'POLYGON',
+               'ARBITRUMONE': 'ARBITRUM', 'OP': 'OPTIMISM'}
     return aliases.get(raw, raw)
 
 
 def chain_options(src, dst, source_exchange, amount):
+    dest_exchange = 'KuCoin' if source_exchange == 'Binance' else 'Binance'
+    def field(row, exchange, kind):
+        if exchange == 'Binance':
+            return row.get({'id': 'network', 'withdraw': 'withdrawEnable',
+                            'deposit': 'depositEnable', 'fee': 'withdrawFee',
+                            'min': 'withdrawMin', 'max': 'withdrawMax',
+                            'deposit_min': 'depositMin'}[kind])
+        return row.get({'id': 'chainId', 'withdraw': 'isWithdrawEnabled',
+                        'deposit': 'isDepositEnabled', 'fee': 'withdrawalMinFee',
+                        'min': 'withdrawalMinSize', 'max': 'maxWithdraw',
+                        'deposit_min': 'depositMinSize'}[kind])
     found = []
     for a in src:
-        name_a = chain_id(a.get('chain') if source_exchange == 'Bybit' else a.get('netWork') or a.get('network'))
+        name_a = chain_id(field(a, source_exchange, 'id'))
         if not name_a:
             continue
-        active_a = a.get('chainWithdraw') == '1' if source_exchange == 'Bybit' else a.get('withdrawEnable') is True
-        if not active_a:
+        if field(a, source_exchange, 'withdraw') is not True:
             continue
-        fixed = positive(a.get('withdrawFee'))
-        pct = positive(a.get('withdrawPercentageFee', '0')) if source_exchange == 'Bybit' else Decimal(0)
-        minimum = positive(a.get('withdrawMin'))
-        maximum = positive(a.get('withdrawMax'))
-        if fixed is None or pct is None or pct >= 1 or minimum is None or amount < minimum or (maximum and amount > maximum):
+        fixed = positive(field(a, source_exchange, 'fee'))
+        pct = positive(a.get('withdrawFeeRate')) if source_exchange == 'KuCoin' else Decimal(0)
+        minimum = positive(field(a, source_exchange, 'min'))
+        max_raw = field(a, source_exchange, 'max')
+        maximum = positive(max_raw) if max_raw not in (None, '') else None
+        if fixed is None or pct is None or pct >= 1 or minimum is None or amount < minimum or (maximum is not None and amount > maximum):
             continue
         for b in dst:
-            name_b = chain_id(b.get('chain') if source_exchange != 'Bybit' else b.get('netWork') or b.get('network'))
-            active_b = b.get('chainDeposit') == '1' if source_exchange != 'Bybit' else b.get('depositEnable') is True
-            if not active_b or name_a != name_b:
+            name_b = chain_id(field(b, dest_exchange, 'id'))
+            if field(b, dest_exchange, 'deposit') is not True or name_a != name_b:
                 continue
             ca, cb = str(a.get('contractAddress') or a.get('contract') or '').lower(), str(b.get('contractAddress') or b.get('contract') or '').lower()
-            if ca and cb and ca != cb:
+            if (ca or cb) and ca != cb:
                 continue
-            received = (amount - fixed) * (1 - pct)
-            deposit_min = positive(b.get('depositMin', '0'))
+            # Add variable and minimum fees conservatively when both apply.
+            received = amount - fixed - amount * pct
+            deposit_min = positive(field(b, dest_exchange, 'deposit_min') or '0')
             if received > 0 and deposit_min is not None and received >= deposit_min:
                 found.append((name_a, received, amount - received))
     return found
 
 
 def orderbook(exchange, symbol):
-    if exchange == 'Bybit':
-        result = bybit('/v5/market/orderbook', {'category': 'spot', 'symbol': symbol, 'limit': 200})
-        return result.get('a', []), result.get('b', [])
-    result = mexc('/api/v3/depth', {'symbol': symbol, 'limit': 200})
+    if exchange == 'KuCoin':
+        pair = symbol[:-4] + '-USDT'
+        result = kucoin('/api/v3/market/orderbook/level2', {'symbol': pair}, True)
+        return result.get('asks', []), result.get('bids', [])
+    result = binance('/api/v3/depth', {'symbol': symbol, 'limit': 500})
     return result.get('asks', []), result.get('bids', [])
 
 
@@ -258,15 +269,15 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
 
 
 def scan_once():
-    if not all((BYBIT_KEY, BYBIT_SECRET, MEXC_KEY, MEXC_SECRET)):
+    if not all((BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE)):
         return []
-    bd, md = tickers()
+    bd, kd = tickers()
     shortlist = []
-    for symbol in bd.keys() & md.keys():
-        b, m = bd[symbol], md[symbol]
+    for symbol in bd.keys() & kd.keys():
+        b, k = bd[symbol], kd[symbol]
         for buy, sell, ask, bid in (
-            ('Bybit', 'MEXC', dec(b.get('ask1Price')), dec(m.get('bidPrice'))),
-            ('MEXC', 'Bybit', dec(m.get('askPrice')), dec(b.get('bid1Price'))),
+            ('Binance', 'KuCoin', dec(b.get('askPrice')), dec(k.get('buy'))),
+            ('KuCoin', 'Binance', dec(k.get('sell')), dec(b.get('bidPrice'))),
         ):
             if ask and bid and ask > 0 and (bid / ask - 1) * 100 >= THRESH:
                 shortlist.append(((bid / ask - 1), symbol, buy, sell, ask, bid))
@@ -313,8 +324,8 @@ def loop():
 
 @app.get('/')
 def home():
-    return {'status': 'ok', 'scanner': 'Bybit-MEXC', 'min_net_profit_pct': float(THRESH),
-            'cost_data_ready': all((BYBIT_KEY, BYBIT_SECRET, MEXC_KEY, MEXC_SECRET))}
+    return {'status': 'ok', 'scanner': 'Binance-KuCoin', 'min_net_profit_pct': float(THRESH),
+            'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE))}
 
 
 def telegram_updates():
@@ -335,7 +346,7 @@ def telegram_updates():
                 chat_id = message.get('chat', {}).get('id')
                 command = message.get('text', '').split(maxsplit=1)
                 if command and command[0].split('@')[0] == '/start' and chat_id:
-                    telegram('✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ 0,5% по Bybit ↔ MEXC.', chat_id)
+                    telegram(f'✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ {THRESH}% по Binance ↔ KuCoin.', chat_id)
                     logging.info('Telegram /start answered')
                 offset = update['update_id'] + 1
         except Exception as exc:
