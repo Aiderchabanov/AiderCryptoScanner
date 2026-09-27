@@ -16,14 +16,10 @@ services:
         sync: false
       - key: BINANCE_API_SECRET
         sync: false
-      - key: KUCOIN_API_KEY
+      - key: GATE_API_KEY
         sync: false
-      - key: KUCOIN_API_SECRET
+      - key: GATE_API_SECRET
         sync: false
-      - key: KUCOIN_API_PASSPHRASE
-        sync: false
-      - key: KUCOIN_API_KEY_VERSION
-        value: "2"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

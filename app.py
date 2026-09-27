@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-import base64
 import logging
 import os
 import threading
@@ -12,15 +11,13 @@ import requests
 from flask import Flask
 
 BINANCE = 'https://api.binance.com'
-KUCOIN = 'https://api.kucoin.com'
+GATE = 'https://api.gateio.ws/api/v4'
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 BINANCE_KEY = os.getenv('BINANCE_API_KEY', '')
 BINANCE_SECRET = os.getenv('BINANCE_API_SECRET', '')
-KUCOIN_KEY = os.getenv('KUCOIN_API_KEY', '')
-KUCOIN_SECRET = os.getenv('KUCOIN_API_SECRET', '')
-KUCOIN_PASSPHRASE = os.getenv('KUCOIN_API_PASSPHRASE', '')
-KUCOIN_KEY_VERSION = os.getenv('KUCOIN_API_KEY_VERSION', '2')
+GATE_KEY = os.getenv('GATE_API_KEY', '')
+GATE_SECRET = os.getenv('GATE_API_SECRET', '')
 THRESH = Decimal(os.getenv('MIN_NET_PROFIT_PCT', '0.5'))
 TRADE = Decimal(os.getenv('TRADE_USDT', '1000'))
 COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SEC', '1800'))
@@ -77,35 +74,31 @@ def binance(path, params=None, signed=False):
     return payload
 
 
-def kucoin(path, params=None, signed=False):
+def gate(path, params=None, signed=False):
     query = urlencode(params or {})
     headers = {}
     if signed:
-        if not all((KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE)):
-            raise RuntimeError('KuCoin read-only credentials missing')
-        timestamp = str(int(time.time() * 1000))
-        def sign(value):
-            digest = hmac.new(KUCOIN_SECRET.encode(), value.encode(), hashlib.sha256).digest()
-            return base64.b64encode(digest).decode()
-        headers = {'KC-API-KEY': KUCOIN_KEY,
-                   'KC-API-SIGN': sign(timestamp + 'GET' + path + ('?' + query if query else '')),
-                   'KC-API-TIMESTAMP': timestamp,
-                   'KC-API-PASSPHRASE': sign(KUCOIN_PASSPHRASE),
-                   'KC-API-KEY-VERSION': KUCOIN_KEY_VERSION}
-    payload = get_json(KUCOIN + path, params=params, headers=headers)
-    if not isinstance(payload, dict) or payload.get('code') != '200000':
-        raise RuntimeError('KuCoin API rejected request')
-    return payload['data']
+        if not GATE_KEY or not GATE_SECRET:
+            raise RuntimeError('Gate read-only credentials missing')
+        timestamp = str(int(time.time()))
+        body_hash = hashlib.sha512(b'').hexdigest()
+        message = '\n'.join(('GET', '/api/v4' + path, query, body_hash, timestamp))
+        signature = hmac.new(GATE_SECRET.encode(), message.encode(), hashlib.sha512).hexdigest()
+        headers = {'KEY': GATE_KEY, 'Timestamp': timestamp, 'SIGN': signature}
+    payload = get_json(GATE + path, params=params, headers=headers)
+    if isinstance(payload, dict) and payload.get('label'):
+        raise RuntimeError('Gate API rejected request')
+    return payload
 
 
 def tickers():
     b = binance('/api/v3/ticker/bookTicker')
-    k = kucoin('/api/v1/market/allTickers')['ticker']
-    if not isinstance(b, list) or not isinstance(k, list):
+    g = gate('/spot/tickers')
+    if not isinstance(b, list) or not isinstance(g, list):
         raise RuntimeError('Invalid market ticker data')
     return ({x['symbol']: x for x in b if x.get('symbol', '').endswith('USDT')},
-            {x['symbol'].replace('-', ''): x for x in k
-             if x.get('symbol', '').endswith('-USDT')})
+            {x['currency_pair'][:-5] + 'USDT': x for x in g
+             if x.get('currency_pair', '').endswith('_USDT')})
 
 
 def telegram(msg, chat_id=None):
@@ -124,10 +117,9 @@ def fee(exchange, symbol):
             row = next((x for x in rows if x.get('symbol') == symbol), None)
             value = row and positive(row.get('takerCommission'))
         else:
-            pair = symbol[:-4] + '-USDT'
-            rows = kucoin('/api/v1/trade-fees', {'symbols': pair}, True)
-            row = next((x for x in rows if x.get('symbol') == pair), None)
-            value = row and positive(row.get('takerFeeRate'))
+            pair = symbol[:-4] + '_USDT'
+            row = gate('/wallet/fee', {'currency_pair': pair}, True)
+            value = positive(row.get('taker_fee')) if isinstance(row, dict) else None
         if value is None or value >= 1:
             raise RuntimeError('Trading fee unavailable')
         return value
@@ -135,9 +127,37 @@ def fee(exchange, symbol):
 
 
 def networks(exchange, coin):
-    if exchange == 'KuCoin':
-        return cached(('chains', exchange, coin), 300,
-                      lambda: kucoin('/api/v3/currencies/' + coin).get('chains', []))
+    if exchange == 'Gate':
+        def load_gate():
+            chains = gate('/wallet/currency_chains', {'currency': coin})
+            statuses = gate('/wallet/withdraw_status', {'currency': coin}, True)
+            if not isinstance(chains, list) or not isinstance(statuses, list):
+                raise RuntimeError('Gate network data unavailable')
+            status = next((s for s in statuses if s.get('currency', '').upper() == coin), None)
+            if not status:
+                return []
+            fees = status.get('withdraw_fix_on_chains') or {}
+            rates = status.get('withdraw_percent_on_chains') or {}
+            if not isinstance(fees, dict) or not isinstance(rates, dict):
+                raise RuntimeError('Gate network fees unavailable')
+            result = []
+            for chain in chains:
+                name = chain.get('chain')
+                if not name:
+                    continue
+                # A global fixed fee is unambiguous only for a single chain.
+                fixed = fees.get(name, status.get('withdraw_fix') if len(chains) == 1 else None)
+                percent = rates.get(name, status.get('withdraw_percent'))
+                result.append({'network': name,
+                               'withdrawEnable': chain.get('is_disabled') == 0 and chain.get('is_withdraw_disabled') == 0,
+                               'depositEnable': chain.get('is_disabled') == 0 and chain.get('is_deposit_disabled') == 0,
+                               'withdrawFee': fixed, 'withdrawRate': percent,
+                               'withdrawMin': status.get('withdraw_amount_mini'),
+                               'withdrawMax': status.get('withdraw_eachtime_limit'),
+                               'depositFee': status.get('deposit'),
+                               'contractAddress': chain.get('contract_address')})
+            return result
+        return cached(('chains', 'Gate', coin), 300, load_gate)
     def load_all():
         rows = binance('/sapi/v1/capital/config/getall', signed=True)
         if not isinstance(rows, list):
@@ -156,17 +176,14 @@ def chain_id(chain):
 
 
 def chain_options(src, dst, source_exchange, amount):
-    dest_exchange = 'KuCoin' if source_exchange == 'Binance' else 'Binance'
+    dest_exchange = 'Gate' if source_exchange == 'Binance' else 'Binance'
     def field(row, exchange, kind):
-        if exchange == 'Binance':
+        if exchange in ('Binance', 'Gate'):
             return row.get({'id': 'network', 'withdraw': 'withdrawEnable',
                             'deposit': 'depositEnable', 'fee': 'withdrawFee',
                             'min': 'withdrawMin', 'max': 'withdrawMax',
                             'deposit_min': 'depositMin'}[kind])
-        return row.get({'id': 'chainId', 'withdraw': 'isWithdrawEnabled',
-                        'deposit': 'isDepositEnabled', 'fee': 'withdrawalMinFee',
-                        'min': 'withdrawalMinSize', 'max': 'maxWithdraw',
-                        'deposit_min': 'depositMinSize'}[kind])
+        raise RuntimeError('Unknown exchange')
     found = []
     for a in src:
         name_a = chain_id(field(a, source_exchange, 'id'))
@@ -175,7 +192,12 @@ def chain_options(src, dst, source_exchange, amount):
         if field(a, source_exchange, 'withdraw') is not True:
             continue
         fixed = positive(field(a, source_exchange, 'fee'))
-        pct = positive(a.get('withdrawFeeRate')) if source_exchange == 'KuCoin' else Decimal(0)
+        percent = a.get('withdrawRate') if source_exchange == 'Gate' else '0'
+        if isinstance(percent, str) and percent.endswith('%'):
+            pct_value = positive(percent[:-1])
+            pct = pct_value / 100 if pct_value is not None else None
+        else:
+            pct = positive(percent)
         minimum = positive(field(a, source_exchange, 'min'))
         max_raw = field(a, source_exchange, 'max')
         maximum = positive(max_raw) if max_raw not in (None, '') else None
@@ -189,7 +211,10 @@ def chain_options(src, dst, source_exchange, amount):
             if (ca or cb) and ca != cb:
                 continue
             # Add variable and minimum fees conservatively when both apply.
-            received = amount - fixed - amount * pct
+            deposit_fee = positive(b.get('depositFee')) if dest_exchange == 'Gate' else Decimal(0)
+            if deposit_fee is None:
+                continue
+            received = amount - fixed - amount * pct - deposit_fee
             deposit_min = positive(field(b, dest_exchange, 'deposit_min') or '0')
             if received > 0 and deposit_min is not None and received >= deposit_min:
                 found.append((name_a, received, amount - received))
@@ -197,9 +222,9 @@ def chain_options(src, dst, source_exchange, amount):
 
 
 def orderbook(exchange, symbol):
-    if exchange == 'KuCoin':
-        pair = symbol[:-4] + '-USDT'
-        result = kucoin('/api/v3/market/orderbook/level2', {'symbol': pair}, True)
+    if exchange == 'Gate':
+        pair = symbol[:-4] + '_USDT'
+        result = gate('/spot/order_book', {'currency_pair': pair, 'limit': 500})
         return result.get('asks', []), result.get('bids', [])
     result = binance('/api/v3/depth', {'symbol': symbol, 'limit': 500})
     return result.get('asks', []), result.get('bids', [])
@@ -269,15 +294,15 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
 
 
 def scan_once():
-    if not all((BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE)):
+    if not all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)):
         return []
-    bd, kd = tickers()
+    bd, gd = tickers()
     shortlist = []
-    for symbol in bd.keys() & kd.keys():
-        b, k = bd[symbol], kd[symbol]
+    for symbol in bd.keys() & gd.keys():
+        b, g = bd[symbol], gd[symbol]
         for buy, sell, ask, bid in (
-            ('Binance', 'KuCoin', dec(b.get('askPrice')), dec(k.get('buy'))),
-            ('KuCoin', 'Binance', dec(k.get('sell')), dec(b.get('bidPrice'))),
+            ('Binance', 'Gate', dec(b.get('askPrice')), dec(g.get('highest_bid'))),
+            ('Gate', 'Binance', dec(g.get('lowest_ask')), dec(b.get('bidPrice'))),
         ):
             if ask and bid and ask > 0 and (bid / ask - 1) * 100 >= THRESH:
                 shortlist.append(((bid / ask - 1), symbol, buy, sell, ask, bid))
@@ -324,8 +349,8 @@ def loop():
 
 @app.get('/')
 def home():
-    return {'status': 'ok', 'scanner': 'Binance-KuCoin', 'min_net_profit_pct': float(THRESH),
-            'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, KUCOIN_KEY, KUCOIN_SECRET, KUCOIN_PASSPHRASE))}
+    return {'status': 'ok', 'scanner': 'Binance-Gate', 'min_net_profit_pct': float(THRESH),
+            'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET))}
 
 
 def telegram_updates():
@@ -346,7 +371,7 @@ def telegram_updates():
                 chat_id = message.get('chat', {}).get('id')
                 command = message.get('text', '').split(maxsplit=1)
                 if command and command[0].split('@')[0] == '/start' and chat_id:
-                    telegram(f'✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ {THRESH}% по Binance ↔ KuCoin.', chat_id)
+                    telegram(f'✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ {THRESH}% по Binance ↔ Gate.', chat_id)
                     logging.info('Telegram /start answered')
                 offset = update['update_id'] + 1
         except Exception as exc:

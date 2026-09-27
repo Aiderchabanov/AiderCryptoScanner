@@ -1,24 +1,23 @@
-# Crypto Spread Scanner — Binance ↔ KuCoin
+# Crypto Spread Scanner — Binance ↔ Gate
 
-The existing Telegram service estimates a repeatable spot arbitrage cycle for `TRADE_USDT` (default $1,000): buy a coin, withdraw it to the other exchange, sell it, then return USDT to the first exchange. It sends an alert only when the estimated net profit is at least `MIN_NET_PROFIT_PCT` (default 0.5%). It never places orders or withdraws funds.
+The Telegram service estimates a repeatable spot arbitrage cycle for `TRADE_USDT` (default $1,000): buy a coin, withdraw it to the other exchange, sell it, and return USDT to the buying exchange. It alerts only when estimated net profit is at least `MIN_NET_PROFIT_PCT` (default 0.5%). It never places orders or withdraws funds.
 
-The estimate consumes the current buy and sell order books in both directions, uses account-specific spot taker rates and current active matching withdrawal/deposit networks, applies published fixed and percentage withdrawal fees, and includes the return USDT transfer. When depth, a fee, a compatible network, or API access is missing, it sends no alert. Networks are cached for 5 minutes; account trading rates for 1 hour. Prices and network status may change during transfer. Deposit fees not exposed by these APIs, tax, promotions paid in other assets, and price movement during transfer are outside the model. Check the destination address and memo/tag yourself before any real transfer.
+It consumes current buy and sell order books in both directions, account-specific spot taker rates, active matching coin and USDT networks, chain-specific fixed and percentage withdrawal costs, and Gate deposit fees reported by its API. If depth, compatible networks, fees, or account API access are missing, no alert is sent. Network information is cached for 5 minutes and trading rates for 1 hour. An alert is an estimate: prices and transfer availability may change before execution. Tax, promotions paid in other assets, and price movement during transfer are outside the model. Check address and memo/tag in the exchanges before any actual transfer.
 
 ## Render environment
 
-Keep the existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Set the following as **secret environment variables** on the active Render service; never send them in chat or commit them:
+On the active `crypto-spread-scanner-eu` Render service, keep the existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Add these **secret environment variables** yourself; never commit or send them in chat:
 
 | Name | Purpose |
 | --- | --- |
-| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Account trade fees and coin/network configuration; read-only access |
-| `KUCOIN_API_KEY` / `KUCOIN_API_SECRET` / `KUCOIN_API_PASSPHRASE` | Actual spot fees and full order book; **General** read-only access |
-| `KUCOIN_API_KEY_VERSION` | Key version shown in KuCoin API settings, default `2` |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Read-only account trade fees and network configuration |
+| `GATE_API_KEY` / `GATE_API_SECRET` | Read-only personal spot fee and withdrawal status |
 
-Create keys for the accounts whose fees you want modeled, with only read permissions. Never allow spot trading or withdrawals on these keys. If an IP allowlist is available, use the service's stable outbound IP; a free host may not have one. If a signed endpoint denies read access, the scanner skips that opportunity.
+Create keys on the same accounts you intend to use. Gate's APIv4 key needs **wallet read-only** access for the fee and withdrawal status calls. Leave trading, fund transfer, and withdrawal write permissions disabled. Check the account's exact allowed permissions. Gate's IP allowlist accepts individual IPv4 addresses, not CIDR ranges; the shared Render `/24` ranges cannot be entered. For an IP-restricted key, use a dedicated outbound IPv4 address rather than choosing one arbitrary IP in Render's ranges.
 
-The service sends no signals until the five credential values exist. `GET /` exposes `cost_data_ready` without exposing credentials. This flag checks presence only; live API permissions are checked during each scan. The old `BYBIT_*` and `MEXC_*` variables are unused and can be removed after the service is running with the new keys.
+The service sends no signals until all four values exist. `GET /` exposes `cost_data_ready` without secrets. That flag only checks presence; invalid permissions cause the scanner to skip opportunities. Old `KUCOIN_*`, `BYBIT_*`, and `MEXC_*` environment values are unused and can be removed after the new keys are running. Do not change the Telegram webhook used by other services.
 
-Optional settings: `MIN_NET_PROFIT_PCT=0.5`, `TRADE_USDT=1000`, `SCAN_INTERVAL_SEC=20`, `ALERT_COOLDOWN_SEC=1800`, `MAX_CANDIDATES_PER_SCAN=10`. The scanner shortlists by gross spread, then checks up to 10 candidates per scan with full costs. `/start` in Telegram responds when polling is available. If another service owns the Telegram webhook, polling is disabled without touching its webhook. A sleeping free Render service does not scan.
+Optional settings: `MIN_NET_PROFIT_PCT=0.5`, `TRADE_USDT=1000`, `SCAN_INTERVAL_SEC=20`, `ALERT_COOLDOWN_SEC=1800`, `MAX_CANDIDATES_PER_SCAN=10`. The scanner shortlists by gross spread, then checks up to ten candidates with full costs each scan. A sleeping Render Free service does not scan.
 
 ## Tests
 
