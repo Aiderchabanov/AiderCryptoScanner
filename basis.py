@@ -13,6 +13,7 @@ MAX_FUNDING_INTERVALS = int(os.getenv('BASIS_FUNDING_INTERVALS', '1'))
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
 MIN_BASIS_NET = Decimal(os.getenv('BASIS_MIN_CONVERGENCE_PCT', '0.5'))
 last_alert = {}
+api_blocked_until = {}
 
 
 def down(value, step):
@@ -190,15 +191,25 @@ def scan(api):
             if spot_price and perp_price and spot_price > 0 and perp_price > spot_price:
                 shortlist.append(((perp_price / spot_price - 1), symbol, spot_name, future_name,
                                   perp_rows[symbol].get('funding_rate')))
-    shortlist.sort(reverse=True)
+    shortlist = sorted((item for direction in (('Binance', 'Gate'), ('Gate', 'Binance'))
+                        for item in sorted((x for x in shortlist if x[2:4] == direction),
+                                           reverse=True)[:MAX_BASIS_CANDIDATES]), reverse=True)
     found = []
-    for _, symbol, spot, future, funding in shortlist[:MAX_BASIS_CANDIDATES]:
+    for _, symbol, spot, future, funding in shortlist:
+        if time.time() < api_blocked_until.get(future, 0):
+            continue
         try:
             item = evaluate(api, symbol, spot, future, funding)
             if item and item['pct'] >= MIN_BASIS_NET:
                 found.append(item)
         except Exception as exc:
-            logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot, future, type(exc).__name__, getattr(getattr(exc, 'response', None), 'status_code', '-'), (getattr(getattr(exc, 'response', None), 'url', '') or '').split('?')[0])
+            response = getattr(exc, 'response', None)
+            status = getattr(response, 'status_code', None)
+            if status in (401, 403, 418, 429):
+                api_blocked_until[future] = time.time() + 3600
+            logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
+                            future, type(exc).__name__, status or '-',
+                            (getattr(response, 'url', '') or '').split('?')[0])
     found.sort(key=lambda x: x['pct'], reverse=True)
     now = time.time()
     for item in found[:3]:
