@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -153,7 +153,7 @@ def fee(exchange, symbol):
         if value is None or value >= 1:
             raise RuntimeError('Trading fee unavailable')
         return value
-    return cached(('fee', exchange, symbol), 3600, load)
+    return cached(('fee', exchange, symbol), 60, load)
 
 
 def networks(exchange, coin):
@@ -187,13 +187,103 @@ def networks(exchange, coin):
                                'depositFee': status.get('deposit'),
                                'contractAddress': chain.get('contract_address')})
             return result
-        return cached(('chains', 'Gate', coin), 300, load_gate)
+        return cached(('chains', 'Gate', coin), 30, load_gate)
     def load_all():
         rows = binance('/sapi/v1/capital/config/getall', signed=True)
         if not isinstance(rows, list):
             raise RuntimeError('Binance chain data unavailable')
         return {x['coin']: x.get('networkList', []) for x in rows if 'coin' in x}
-    return cached(('chains', 'Binance'), 300, load_all).get(coin, [])
+    return cached(('chains', 'Binance'), 30, load_all).get(coin, [])
+
+
+def spot_rules(exchange, symbol, side):
+    """Read market-order limits; missing or malformed critical fields fail closed."""
+    def optional_limit(row, key):
+        raw = row.get(key)
+        if raw is None:
+            return None
+        value = positive(raw)
+        if value is None:
+            raise RuntimeError('Malformed pair limit')
+        return value
+
+    def load():
+        if exchange == 'Gate':
+            row = gate('/spot/currency_pairs/' + symbol[:-4] + '_USDT')
+            if not isinstance(row, dict) or row.get('id') != symbol[:-4] + '_USDT':
+                raise RuntimeError('Gate pair rules unavailable')
+            if not {'min_base_amount', 'min_quote_amount', 'amount_precision', 'trade_status'} <= row.keys():
+                raise RuntimeError('Gate pair limits unavailable')
+            if row.get('trade_status') not in ('tradable', 'buyable' if side == 'buy' else 'sellable'):
+                raise RuntimeError('Gate pair not open for this side')
+            precision = row.get('amount_precision')
+            if type(precision) is not int or not 0 <= precision <= 18:
+                raise RuntimeError('Gate amount precision unavailable')
+            return {'min_qty': optional_limit(row, 'min_base_amount') or Decimal(0),
+                    'min_quote': optional_limit(row, 'min_quote_amount') or Decimal(0),
+                    'max_qty': optional_limit(row, 'max_base_amount'),
+                    'max_quote': optional_limit(row, 'max_quote_amount'),
+                    'step': Decimal(1).scaleb(-precision),
+                    'market_max_qty': optional_limit(row, 'market_order_max_stock'),
+                    'market_max_quote': optional_limit(row, 'market_order_max_money')}
+        rows = binance('/api/v3/exchangeInfo', {'symbol': symbol})
+        row = next((x for x in rows.get('symbols', []) if x.get('symbol') == symbol), None)
+        if not row or row.get('status') != 'TRADING' or 'MARKET' not in row.get('orderTypes', []):
+            raise RuntimeError('Binance market pair unavailable')
+        filters = {x['filterType']: x for x in row.get('filters', [])}
+        lot = filters.get('LOT_SIZE')
+        market = filters.get('MARKET_LOT_SIZE') or lot
+        if not lot or not market:
+            raise RuntimeError('Binance lot rules unavailable')
+        market_step = positive(market.get('stepSize'))
+        lot_step = positive(lot.get('stepSize'))
+        step = market_step or lot_step
+        min_qty = positive(market.get('minQty'))
+        max_qty = positive(market.get('maxQty'))
+        lot_min, lot_max = positive(lot.get('minQty')), positive(lot.get('maxQty'))
+        if step is None or step <= 0 or not lot_step or min_qty is None or lot_min is None or max_qty is None or lot_max is None:
+            raise RuntimeError('Binance lot rules malformed')
+        if market_step and (max(step, lot_step) / min(step, lot_step)) % 1:
+            raise RuntimeError('Binance market and lot steps incompatible')
+        step = max(step, lot_step)
+        limits = [x for x in (filters.get('MIN_NOTIONAL'), filters.get('NOTIONAL')) if x]
+        if not limits:
+            raise RuntimeError('Binance notional rule unavailable')
+        min_values = [positive(x.get('minNotional')) for x in limits]
+        if any(x is None for x in min_values):
+            raise RuntimeError('Binance notional rule malformed')
+        max_values = [positive(x.get('maxNotional')) for x in limits if x.get('maxNotional') is not None]
+        if any(x is None for x in max_values):
+            raise RuntimeError('Binance notional max malformed')
+        max_quantities = [x for x in (max_qty, lot_max) if x > 0]
+        return {'min_qty': max(min_qty, lot_min), 'min_quote': max(min_values),
+                'max_qty': min(max_quantities) if max_quantities else None,
+                'max_quote': min(max_values) if max_values else None, 'step': step,
+                'market_max_qty': None, 'market_max_quote': None}
+    # Trading status is checked on each scan. Structural limits can be cached briefly.
+    return cached(('spot-rules', exchange, symbol, side), 30, load)
+
+
+def order_size_ok(rules, quantity, notional):
+    if not rules or quantity <= 0 or notional <= 0:
+        return False
+    for key in ('min_qty', 'min_quote', 'step'):
+        if rules.get(key) is None:
+            return False
+    if quantity < rules['min_qty'] or notional < rules['min_quote']:
+        return False
+    for key, value in (('max_qty', quantity), ('market_max_qty', quantity),
+                       ('max_quote', notional), ('market_max_quote', notional)):
+        if rules.get(key) is not None and rules[key] > 0 and value > rules[key]:
+            return False
+    return True
+
+
+def sale_quantity(quantity, rules):
+    step = rules.get('step') if rules else None
+    if not step or step <= 0:
+        return None
+    return (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
 def chain_id(chain):
@@ -300,13 +390,20 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
     base = buy_for_usdt(asks, TRADE)
     if base is None:
         return None
+    buy_rules = spot_rules(buy, symbol, 'buy')
+    sell_rules = spot_rules(sell, symbol, 'sell')
+    if not order_size_ok(buy_rules, base, TRADE):
+        return None
     buy_rate, sell_rate = fee(buy, symbol), fee(sell, symbol)
     coin_to_transfer = base * (1 - buy_rate)
     coin_routes = chain_options(networks(buy, coin), networks(sell, coin), buy, coin_to_transfer)
     best = None
-    for coin_net, sell_qty, coin_cost in coin_routes:
+    for coin_net, transferred_qty, coin_cost in coin_routes:
+        sell_qty = sale_quantity(transferred_qty, sell_rules)
+        if sell_qty is None or sell_qty <= 0:
+            continue
         proceeds = sell_for_usdt(bids, sell_qty)
-        if proceeds is None:
+        if proceeds is None or not order_size_ok(sell_rules, sell_qty, proceeds):
             continue
         after_trade = proceeds * (1 - sell_rate)
         # Return the USDT to the buying exchange so a repeatable cycle is priced.
@@ -324,8 +421,10 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
                 best = dict(symbol=symbol, buy=buy, sell=sell, net=net, profit=profit,
                             gross=gross, coin_net=coin_net, usdt_net=usdt_net,
                             coin_cost=coin_cost, usdt_cost=usdt_cost,
+                            unsold_dust=transferred_qty - sell_qty,
                             buy_fee=buy_rate * 100, sell_fee=sell_rate * 100,
                             buy_price=buy_vwap, sell_price=sell_vwap,
+                            sell_qty=sell_qty,
                             buy_slippage=buy_slippage, sell_slippage=sell_slippage,
                             price_buffer=price_buffer)
     return best
@@ -365,6 +464,8 @@ def scan_once():
                 f"Исходный спред лучших цен: {item['gross']:.2f}%.\n"
                 f"Торговые комиссии (taker): {item['buy_fee']:.3f}% / {item['sell_fee']:.3f}%.\n"
                 f"Монета: сеть {item['coin_net']}, вывод и зачисление {item['coin_cost']:.8g} {item['symbol'][:-4]}.\n"
+                f"Остаток ниже шага ордера: {item['unsold_dust']:.8g} {item['symbol'][:-4]} "
+                "(не включён в прибыль).\n"
                 f"Возврат USDT: сеть {item['usdt_net']}, вывод и зачисление {item['usdt_cost']:.4f} USDT.\n"
                 f"Проскальзывание по стаканам: {item['buy_slippage']:.4f} + "
                 f"{item['sell_slippage']:.4f} USDT (уже включено в цены).\n"
