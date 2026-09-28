@@ -6,8 +6,8 @@ import time
 from decimal import Decimal, ROUND_DOWN
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
-LEG_USDT = Decimal(os.getenv('BASIS_LEG_USDT', '50'))
-RESERVE_USDT = Decimal(os.getenv('BASIS_RESERVE_USDT', '50'))
+LEG_USDT = Decimal('50')
+RESERVE_USDT = Decimal('50')
 EXIT_SLIPPAGE = Decimal(os.getenv('BASIS_EXIT_SLIPPAGE_PCT', '0.30')) / 100
 MAX_FUNDING_INTERVALS = int(os.getenv('BASIS_FUNDING_INTERVALS', '1'))
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
