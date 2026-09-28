@@ -198,7 +198,7 @@ def scan(api):
             if item and item['pct'] >= MIN_BASIS_NET:
                 found.append(item)
         except Exception as exc:
-            logging.warning('Basis skipped %s %s/%s: %s', symbol, spot, future, type(exc).__name__)
+            logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot, future, type(exc).__name__, getattr(getattr(exc, 'response', None), 'status_code', '-'), (getattr(getattr(exc, 'response', None), 'url', '') or '').split('?')[0])
     found.sort(key=lambda x: x['pct'], reverse=True)
     now = time.time()
     for item in found[:3]:
