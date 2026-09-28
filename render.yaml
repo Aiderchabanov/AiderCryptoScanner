@@ -24,3 +24,5 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: PAPER_DATABASE_URL
+        sync: false

@@ -1,7 +1,7 @@
 """Persistent, read-only observations of spot/perpetual spread episodes.
 
-Only a configured SQLite path on a persistent volume enables production
-observations. No exchange order, transfer, or account balance API is used.
+Production uses a TLS-protected PostgreSQL connection. Local SQLite files
+remain available for isolated tests. No exchange order or transfer API is used.
 """
 
 import json
@@ -11,14 +11,28 @@ import sqlite3
 import statistics
 import time
 from contextlib import contextmanager
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 HORIZONS = (1, 5, 15, 30, 60)
 WINDOW_SECONDS = 60
 EPISODE_COOLDOWN_SECONDS = 7200
 MIN_HISTORY = 30
 CLOSED_PCT = Decimal('0.10')
+_storage_check = (0, False)
+
+
+def database_url():
+    value = os.getenv('PAPER_DATABASE_URL', '')
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in ('postgres', 'postgresql') or not parsed.hostname:
+        raise RuntimeError('Invalid PostgreSQL configuration')
+    if parse_qs(parsed.query).get('sslmode', [''])[0] not in ('require', 'verify-ca', 'verify-full'):
+        raise RuntimeError('PostgreSQL requires TLS (sslmode=require)')
+    return value
 
 
 def configured_path():
@@ -36,13 +50,30 @@ def configured_path():
 
 
 def storage_ready():
+    global _storage_check
     try:
+        if database_url():
+            now = time.monotonic()
+            if now < _storage_check[0]:
+                return _storage_check[1]
+            with session() as db:
+                db.execute('SELECT 1')
+            _storage_check = (now + 30, True)
+            return True
         return configured_path() is not None
-    except RuntimeError:
+    except Exception as exc:
+        logging.warning('Paper database unavailable: %s', type(exc).__name__)
+        _storage_check = (time.monotonic() + 15, False)
         return False
 
 
 def connect(path=None):
+    if path is None and database_url():
+        try:
+            from paper_pg import PgConnection
+            return PgConnection(database_url())
+        except Exception:
+            raise RuntimeError('PostgreSQL observation storage unavailable') from None
     path = Path(path) if path else configured_path()
     if path is None:
         raise RuntimeError('Persistent observation storage is not configured')
@@ -113,11 +144,27 @@ def session(path=None):
         db.close()
 
 
+def first_value(row):
+    return next(iter(row.values())) if isinstance(row, dict) else row[0]
+
+
 def record(item, path=None, at=None):
     """Create one episode for a qualified alert; return its ID or None."""
     now = time.time() if at is None else at
+    try:
+        rate = Decimal(str(item['funding']))
+        next_at = float(item['next_funding_at'])
+    except (KeyError, InvalidOperation, ValueError, TypeError):
+        return None
+    if not rate.is_finite() or rate <= 0 or next_at <= now:
+        return None  # Defense in depth; basis.scan also rechecks live funding.
     with session(path) as db:
-        db.execute('BEGIN IMMEDIATE')
+        if getattr(db, 'is_postgres', False):
+            # Serialize episode creation for this pair, including the first row.
+            db.execute('SELECT pg_advisory_xact_lock(hashtext(?))',
+                       (item['symbol'] + ':' + item['spot'] + ':' + item['future'],))
+        else:
+            db.execute('BEGIN IMMEDIATE')
         prior = db.execute('''SELECT * FROM episodes WHERE symbol=? AND spot_exchange=?
                AND futures_exchange=? ORDER BY started_at DESC LIMIT 1''',
                (item['symbol'], item['spot'], item['future'])).fetchone()
@@ -127,7 +174,14 @@ def record(item, path=None, at=None):
             return None
         raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
         executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
-        snapshot = {key: str(value) for key, value in item.items()}
+        # Explicit allowlist: never persist API credentials or future private fields.
+        saved_fields = ('symbol', 'spot', 'future', 'quantity', 'spot_cost',
+                        'future_notional', 'spot_ask', 'spot_entry', 'future_bid',
+                        'future_entry', 'pct', 'funding', 'next_funding_at',
+                        'funding_debit', 'spot_fee', 'future_fee',
+                        'spot_slippage_usdt', 'futures_slippage_usdt',
+                        'price_buffer', 'multiplier')
+        snapshot = {key: str(item[key]) for key in saved_fields if key in item}
         row = (item['symbol'], item['spot'], item['future'], 'spot_buy/futures_short',
                now, '50', str(item['spot_cost']), str(item['future_notional']),
                str(item['quantity']), str(item['spot_ask']), str(item['spot_entry']),
@@ -141,8 +195,9 @@ def record(item, path=None, at=None):
              spot_ask, spot_vwap, futures_bid, futures_vwap, raw_spread_pct,
              executable_spread_pct, net_projected_pct, funding_rate,
              next_funding_at, funding_cost_usdt, cost_snapshot_json, min_spread_pct)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', row)
-        episode_id = cursor.lastrowid
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'''
+            + (' RETURNING id' if getattr(db, 'is_postgres', False) else ''), row)
+        episode_id = cursor.fetchone()['id'] if getattr(db, 'is_postgres', False) else cursor.lastrowid
         db.executemany('''INSERT INTO checkpoints
             (episode_id, horizon_min, due_at, status) VALUES (?,?,?,?)''',
             [(episode_id, minute, now + minute * 60, 'pending') for minute in HORIZONS])
@@ -201,24 +256,26 @@ def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
             db.execute('''UPDATE episodes SET first_close_min=COALESCE(first_close_min,?),
                           status='closed' WHERE id=?''', (minute, episode['id']))
     if minute == 60:
-        pending = db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status!='observed'",
-                             (episode['id'],)).fetchone()[0]
+        pending = first_value(db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status!='observed'",
+                                         (episode['id'],)).fetchone())
         if pending and not db.execute('SELECT first_close_min FROM episodes WHERE id=?',
-                                     (episode['id'],)).fetchone()[0]:
+                                     (episode['id'],)).fetchone()['first_close_min']:
             state = 'incomplete'
         else:
             state = 'closed' if db.execute('SELECT first_close_min FROM episodes WHERE id=?',
-                                           (episode['id'],)).fetchone()[0] else 'not_closed_60m'
+                                           (episode['id'],)).fetchone()['first_close_min'] else 'not_closed_60m'
         db.execute('UPDATE episodes SET status=? WHERE id=?', (state, episode['id']))
 
 
 def poll(api, path=None, at=None):
     now = time.time() if at is None else at
     with session(path) as db:
-        rows = db.execute('''SELECT e.*, c.horizon_min, c.due_at FROM checkpoints c
+        sql = '''SELECT e.*, c.horizon_min, c.due_at FROM checkpoints c
             JOIN episodes e ON e.id=c.episode_id
-            WHERE c.status='pending' AND c.due_at<=? ORDER BY c.due_at LIMIT 30''',
-            (now,)).fetchall()
+            WHERE c.status='pending' AND c.due_at<=? ORDER BY c.due_at LIMIT 30'''
+        if getattr(db, 'is_postgres', False):
+            sql += ' FOR UPDATE OF c SKIP LOCKED'
+        rows = db.execute(sql, (now,)).fetchall()
         for episode in rows:
             minute = episode['horizon_min']
             if now > episode['due_at'] + WINDOW_SECONDS:
@@ -242,8 +299,8 @@ def statistics_for(db, symbol=None):
     rows = db.execute(query, params).fetchall()
     complete = []
     for row in rows:
-        samples = db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status='observed'",
-                             (row['id'],)).fetchone()[0]
+        samples = first_value(db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status='observed'",
+                                         (row['id'],)).fetchone())
         if samples == len(HORIZONS):
             complete.append(row)
     times = [x['first_close_min'] for x in complete if x['first_close_min'] is not None]

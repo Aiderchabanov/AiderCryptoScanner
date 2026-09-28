@@ -58,18 +58,21 @@ adds no funding cost. Funding can change; projected convergence and exit
 slippage remain estimates, not guaranteed trading profits. No order or
 withdrawal endpoint is called.
 
-Storage schema (SQLite):
+Storage schema (PostgreSQL in production, SQLite for local tests):
 
 | Table | Contents |
 | --- | --- |
 | `episodes` | Coin, spot/futures venues and direction, UTC signal time, target $50, actual leg notionals and size, best and depth prices, raw and executable spread, fee/cost snapshot JSON, funding rate and next timestamp, net model, lowest observed spread, first closure checkpoint, status. |
 | `checkpoints` | Episode ID, due and actual times, 1/5/15/30/60-minute horizon, observed or missing status, best and depth prices, both spreads, reduction in percentage points and relative percentage, missing-data reason. |
 
-**Render persistence:** Set `PAPER_DB_PATH=/var/data/scanner.sqlite3` only after
-attaching a real persistent disk mounted at `/var/data`. The code checks that
-the mount exists. Render's Free web service has an ephemeral filesystem and
-cannot attach a persistent disk. Until durable storage is available, basis
-alerts and virtual tracking are paused; the existing spot cycle continues.
-No database secret is needed for this disk-backed SQLite option. A short local
-test can set `PAPER_DB_PATH` to a temporary file; it does not prove production
-persistence. Backups are still prudent, especially before schema changes.
+**Render persistence:** Create a dedicated free Neon PostgreSQL project and add
+its connection string as the secret environment variable `PAPER_DATABASE_URL`
+on the existing Render web service. The URL must use PostgreSQL with
+`sslmode=require` (or a stricter verification mode). Never put it in GitHub or
+chat. The scanner checks connection and schema before enabling paper signals;
+unavailable storage fails closed. After restart/deploy, due checkpoints are read
+from the same database. A missed one-minute observation window is marked
+`missing`, never reconstructed from last trade. Neon free storage and compute
+limits apply; monitor usage and back up important history. The SQLite
+`PAPER_DB_PATH` option remains for local tests or a real persistent disk, never
+Render's ephemeral free filesystem. No API credentials are stored in episodes.

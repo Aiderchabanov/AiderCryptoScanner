@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from decimal import Decimal as D
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import app
 import paper
+import paper_pg
 
 
 def example():
@@ -94,6 +95,50 @@ class PaperTests(unittest.TestCase):
         self.assertEqual(value['spot_vwap'], D('10.6'))
         self.assertEqual(value['futures_vwap'], D('11.2'))
         self.assertLess(value['executable_spread_pct'], value['raw_spread_pct'])
+
+    def test_nonpositive_or_unknown_funding_never_records(self):
+        for funding in (D('-0.0001'), D('0'), None):
+            item = example()
+            item['funding'] = funding
+            self.assertIsNone(paper.record(item, self.path, self.start))
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM episodes').fetchone()[0], 0)
+
+    def test_only_allowlisted_market_data_is_stored(self):
+        item = example()
+        item['secret_api_key'] = 'must-not-be-persisted'
+        episode = paper.record(item, self.path, self.start)
+        with paper.session(self.path) as db:
+            snapshot = db.execute('SELECT cost_snapshot_json FROM episodes WHERE id=?',
+                                  (episode,)).fetchone()[0]
+        self.assertNotIn('must-not-be-persisted', snapshot)
+        self.assertEqual(json.loads(snapshot)['funding'], '0.0001')
+
+    def test_postgres_configuration_fails_closed_without_tls(self):
+        with patch.object(paper, '_storage_check', (0, False)), \
+             patch.dict('os.environ', {'PAPER_DATABASE_URL': 'postgresql://db.example/test'}, clear=False):
+            self.assertFalse(paper.storage_ready())
+        with patch.object(paper, '_storage_check', (0, False)), \
+             patch.dict('os.environ', {'PAPER_DATABASE_URL': 'postgresql://db.example/test?sslmode=require'}, clear=False), \
+             patch.object(paper_pg, 'PgConnection', side_effect=OSError('database not ready')):
+            self.assertFalse(paper.storage_ready())
+
+    def test_postgres_adapter_uses_parameters_and_schema(self):
+        raw = MagicMock()
+        with patch.object(paper_pg, '_schema_ready', False), \
+             patch.object(paper_pg.psycopg, 'connect', return_value=raw) as connect:
+            db = paper_pg.PgConnection('postgresql://example/test?sslmode=require')
+            db.execute('SELECT * FROM episodes WHERE id=? AND CAST(min_spread_pct AS REAL)>?', (4, 0.1))
+            db.executemany('INSERT INTO checkpoints VALUES (?,?)', [(1, 5)])
+            db.close()
+        connect.assert_called_once()
+        self.assertTrue(any('CREATE TABLE IF NOT EXISTS episodes' in call.args[0]
+                            for call in raw.execute.call_args_list))
+        self.assertEqual(raw.execute.call_args.args,
+                         ('SELECT * FROM episodes WHERE id=%s AND CAST(min_spread_pct AS DOUBLE PRECISION)>%s',
+                          (4, 0.1)))
+        raw.cursor.return_value.__enter__.return_value.executemany.assert_called_once_with(
+            'INSERT INTO checkpoints VALUES (%s,%s)', [(1, 5)])
 
 
 if __name__ == '__main__':
