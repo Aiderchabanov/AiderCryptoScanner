@@ -48,9 +48,11 @@ Coin history is displayed in new basis alerts after 30 complete observations;
 below that it says `недостаточно истории`. `/stats` shows scanner-wide results
 and `/stats HBAR` one coin in the configured Telegram chat.
 
-Funding is read again for the specific futures contract and next funding time.
-For a short, a negative estimated rate is a possible expense if next funding
-falls within the 60-minute observation horizon and filters the alert. Positive
+Funding is fetched for the specific futures contract during evaluation and
+again immediately before creating a virtual episode or sending Telegram. Only
+a strictly positive current rate with a future settlement time is allowed.
+Zero, negative, missing, or failed API responses reject the signal and virtual
+episode; nonpositive rates are logged as `REJECTED_NEGATIVE_FUNDING`. Positive
 funding is never counted as guaranteed income. A settlement after the horizon
 adds no funding cost. Funding can change; projected convergence and exit
 slippage remain estimates, not guaranteed trading profits. No order or
