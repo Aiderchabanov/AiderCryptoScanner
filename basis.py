@@ -206,7 +206,9 @@ def scan(api):
             response = getattr(exc, 'response', None)
             status = getattr(response, 'status_code', None)
             if status in (401, 403, 418, 429):
-                api_blocked_until[future] = time.time() + 3600
+                retry_after = getattr(response, 'headers', {}).get('Retry-After', '') if response else ''
+                delay = max(3600, int(retry_after)) if retry_after.isdigit() else 3600
+                api_blocked_until[future] = time.time() + delay
             logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
                             future, type(exc).__name__, status or '-',
                             (getattr(response, 'url', '') or '').split('?')[0])
