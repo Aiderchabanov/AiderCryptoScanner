@@ -137,6 +137,26 @@ def funding_expense(rate, direction, notional, crosses):
     return max(signed_cost, Decimal(0)) * notional
 
 
+def fresh_funding(api, exchange, symbol):
+    """Fetch the contract's funding independently of cached market metadata."""
+    if exchange == 'Binance':
+        row = api.get_json(FUTURES_BINANCE + '/fapi/v1/premiumIndex', params={'symbol': symbol})
+        rate = api.dec(row.get('lastFundingRate'))
+        next_ms = api.dec(row.get('nextFundingTime'))
+        next_at = float(next_ms / 1000) if next_ms is not None else None
+    else:
+        row = api.gate('/futures/usdt/contracts/' + symbol[:-4] + '_USDT')
+        raw_rate = row.get('funding_rate_next')
+        if raw_rate is None or raw_rate == '':
+            raw_rate = row.get('funding_rate')
+        rate = api.dec(raw_rate)
+        next_seconds = api.dec(row.get('funding_next_apply'))
+        next_at = float(next_seconds) if next_seconds is not None else None
+    if rate is None or abs(rate) > Decimal('0.1') or next_at is None or next_at <= time.time():
+        raise ValueError('Current funding rate or next settlement unavailable')
+    return rate, next_at
+
+
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     meta = futures_meta(api, future_exchange, symbol)
     buy_fee = api.fee(spot_exchange, symbol)
@@ -162,20 +182,8 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
         return None
     if cost < LEG_USDT * Decimal('0.8') or short_proceeds < LEG_USDT * Decimal('0.8'):
         return None
-    funding = None
-    next_funding = None
-    if future_exchange == 'Binance':
-        premium = api.get_json(FUTURES_BINANCE + '/fapi/v1/premiumIndex', params={'symbol': symbol})
-        funding = api.dec(premium.get('lastFundingRate'))
-        millis = api.dec(premium.get('nextFundingTime'))
-        next_funding = float(millis / 1000) if millis is not None else None
-    else:
-        current = api.gate('/futures/usdt/contracts/' + symbol[:-4] + '_USDT')
-        funding = api.dec(current.get('funding_rate_next') or current.get('funding_rate'))
-        next_funding = float(api.dec(current.get('funding_next_apply'))) if api.dec(current.get('funding_next_apply')) is not None else None
+    funding, next_funding = fresh_funding(api, future_exchange, symbol)
     now = time.time()
-    if funding is None or abs(funding) > Decimal('0.1') or next_funding is None or next_funding <= now:
-        raise ValueError('Current funding rate or next settlement unavailable')
     crosses_funding = next_funding <= now + 60 * 60
     # Short pays negative funding; a possible positive receipt is not booked.
     funding_debit = funding_expense(funding, 'short', short_proceeds, crosses_funding)
@@ -194,7 +202,7 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
             'future_exit': price * (1 + EXIT_SLIPPAGE), 'projected': projected,
             'pct': pct, 'spot_fee': buy_fee, 'future_fee': perp_fee,
             'funding': funding, 'next_funding_at': next_funding,
-            'funding_crosses_60m': crosses_funding, 'funding_filtered': funding_debit > 0,
+            'funding_crosses_60m': crosses_funding, 'funding_filtered': funding <= 0,
             'funding_debit': funding_debit, 'price_buffer': price_buffer,
             'spot_ask': spot_ask, 'future_bid': perp_bid,
             'spot_slippage_usdt': max(Decimal(0), cost - acquired * spot_ask),
@@ -233,7 +241,7 @@ def scan(api):
             if item and item['pct'] >= MIN_BASIS_NET and not item['funding_filtered']:
                 found.append(item)
             elif item and item['funding_filtered']:
-                logging.info('Basis %s %s/%s filtered: short funding expense before +60m',
+                logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING: nonpositive rate',
                              symbol, spot, future)
         except Exception as exc:
             response = getattr(exc, 'response', None)
@@ -250,6 +258,15 @@ def scan(api):
     for item in found[:3]:
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
+            # Recheck directly before creating an episode or sending Telegram.
+            rate, next_at = fresh_funding(api, item['future'], item['symbol'])
+            if rate <= 0:
+                logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING at final check',
+                             item['symbol'], item['spot'], item['future'])
+                continue
+            item['funding'], item['next_funding_at'] = rate, next_at
+            item['funding_crosses_60m'] = next_at <= time.time() + 3600
+            item['funding_debit'] = Decimal(0)  # Positive short funding is never booked as certain income.
             episode_id = paper.record(item)
             if episode_id is None:
                 continue  # Same continuous spread episode.
@@ -267,6 +284,9 @@ def format_alert(x):
             f"(≈ {x['projected']:.2f} USDT на {x['spot_cost']:.2f} USDT спота).\n"
             f"Купить спот {x['spot']}: {x['quantity']:.8g} по ≈ {x['spot_entry']:.8g} USDT.\n"
             f"Открыть шорт {x['future']}: тот же объём по ≈ {x['future_entry']:.8g} USDT.\n"
+            f"Funding: +{x['funding']*100:.4f}%\n"
+            f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(x['next_funding_at']))}\n"
+            "Статус: положительный — условие выполнено.\n"
             f"Модель выхода при схождении около {x['spot_entry']:.8g}: "
             f"спот ≈ {x['spot_exit']:.8g}, покрытие шорта ≈ {x['future_exit']:.8g}.\n"
             f"Комиссии спот/фьючерс за сторону: {x['spot_fee']*100:.3f}% / "

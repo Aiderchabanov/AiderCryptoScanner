@@ -1,7 +1,7 @@
 import unittest
 import time
 from decimal import Decimal as D
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import app
 import basis
@@ -52,13 +52,62 @@ class BasisTests(unittest.TestCase):
             gate.return_value = {'funding_rate': '-0.001', 'funding_next_apply': time.time() + 7200}
             before = basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate')
             self.assertEqual(before['funding_debit'], 0)
-            self.assertFalse(before['funding_filtered'])
+            self.assertTrue(before['funding_filtered'])
             gate.return_value = {'funding_rate': '0.001', 'funding_next_apply': time.time() + 1800}
             positive = basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate')
             self.assertEqual(positive['funding_debit'], 0)  # Never book projected income.
+            self.assertFalse(positive['funding_filtered'])
+            gate.return_value = {'funding_rate_next': '0', 'funding_rate': '0.001',
+                                 'funding_next_apply': time.time() + 1800}
+            zero = basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate')
+            self.assertTrue(zero['funding_filtered'])
             gate.return_value = {}
             with self.assertRaises(ValueError):
                 basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate')
+
+    def test_final_funding_recheck_blocks_episode_and_telegram(self):
+        api = Mock()
+        api.BINANCE_KEY = api.BINANCE_SECRET = api.GATE_KEY = api.GATE_SECRET = 'configured'
+        api.dec = app.dec
+        api.tickers.return_value = ({'ABCUSDT': {'askPrice': '10'}}, {})
+        candidate = {'symbol': 'ABCUSDT', 'spot': 'Binance', 'future': 'Gate',
+                     'pct': D('0.8'), 'funding_filtered': False, 'funding': D('0.001')}
+        with patch.object(basis.paper, 'storage_ready', return_value=True), \
+             patch.object(basis, 'futures_markets', return_value=({}, {'ABCUSDT': {'highest_bid': '10.3'}})), \
+             patch.object(basis, 'evaluate', return_value=candidate), \
+             patch.object(basis, 'fresh_funding') as funding, \
+             patch.object(basis.paper, 'record') as record:
+            for rejected in ((D('-0.001'), time.time() + 1800),
+                             (D('0'), time.time() + 1800)):
+                funding.return_value = rejected
+                self.assertEqual(len(basis.scan(api)), 1)
+                record.assert_not_called()
+                api.telegram.assert_not_called()
+            funding.side_effect = ValueError('funding unavailable')
+            basis.scan(api)
+            record.assert_not_called()
+            api.telegram.assert_not_called()
+
+    def test_funding_snapshot_is_live_and_message_shows_positive_rate(self):
+        api = Mock()
+        api.dec = app.dec
+        api.gate.return_value = {'funding_rate_next': '0.00123456',
+                                 'funding_next_apply': time.time() + 1800}
+        rate, next_at = basis.fresh_funding(api, 'Gate', 'ABCUSDT')
+        self.assertEqual(rate, D('0.00123456'))
+        self.assertGreater(next_at, time.time())
+        api.gate.assert_called_once_with('/futures/usdt/contracts/ABC_USDT')
+        message = basis.format_alert({
+            'symbol': 'ABCUSDT', 'pct': D('0.8'), 'projected': D('0.40'),
+            'spot_cost': D('50'), 'spot': 'Binance', 'future': 'Gate',
+            'quantity': D('5'), 'spot_entry': D('10'), 'future_entry': D('10.3'),
+            'spot_exit': D('9.97'), 'future_exit': D('10.03'),
+            'spot_fee': D('0.001'), 'future_fee': D('0.001'),
+            'funding_debit': D('0'), 'funding': rate, 'next_funding_at': next_at,
+            'price_buffer': D('0.1'), 'reserve': D('50')})
+        self.assertIn('Funding: +0.1235%', message)
+        self.assertIn('Следующий funding:', message)
+        self.assertIn('Статус: положительный — условие выполнено.', message)
 
     def test_rejects_tiny_liquidity_and_missing_fee(self):
         metadata = {'step': D('0.1'), 'min_qty': D('0.1'),
