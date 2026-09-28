@@ -9,6 +9,7 @@ from urllib.parse import urlencode, urlparse
 
 import requests
 from flask import Flask
+import basis
 
 BINANCE = 'https://api.binance.com'
 GATE = 'https://api.gateio.ws/api/v4'
@@ -72,6 +73,18 @@ def binance(path, params=None, signed=False):
     if isinstance(payload, dict) and 'code' in payload and int(payload['code']) < 0:
         raise RuntimeError('Binance API rejected request')
     return payload
+
+
+def binance_signed_params(params):
+    if not BINANCE_KEY or not BINANCE_SECRET:
+        raise RuntimeError('Binance read-only credentials missing')
+    params = dict(params)
+    params['timestamp'] = int(time.time() * 1000)
+    params['recvWindow'] = 5000
+    params['signature'] = hmac.new(BINANCE_SECRET.encode(), urlencode(params).encode(),
+                                   hashlib.sha256).hexdigest()
+    return params
+
 
 
 def gate(path, params=None, signed=False):
@@ -347,10 +360,25 @@ def loop():
         time.sleep(SCAN)
 
 
+def basis_loop():
+    while True:
+        try:
+            results = basis.scan(__import__(__name__))
+            logging.info('basis scan: %s conditional alerts', len(results))
+        except Exception:
+            logging.exception('basis scan failed')
+        time.sleep(max(60, SCAN))
+
+
+
+
+
 @app.get('/')
 def home():
     return {'status': 'ok', 'scanner': 'Binance-Gate', 'min_net_profit_pct': float(THRESH),
-            'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET))}
+            'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)),
+            'basis_mode': 'read-only', 'basis_leg_usdt': float(basis.LEG_USDT),
+            'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT)}
 
 
 def telegram_updates():
@@ -399,6 +427,7 @@ def log_webhook_owner():
 
 if __name__ == '__main__':
     threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=basis_loop, daemon=True).start()
     if log_webhook_owner():
         threading.Thread(target=telegram_updates, daemon=True).start()
     else:
