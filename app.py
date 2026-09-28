@@ -19,13 +19,16 @@ BINANCE_KEY = os.getenv('BINANCE_API_KEY', '')
 BINANCE_SECRET = os.getenv('BINANCE_API_SECRET', '')
 GATE_KEY = os.getenv('GATE_API_KEY', '')
 GATE_SECRET = os.getenv('GATE_API_SECRET', '')
-THRESH = Decimal(os.getenv('MIN_NET_PROFIT_PCT', '0.5'))
-TRADE = Decimal(os.getenv('TRADE_USDT', '1000'))
+THRESH = max(Decimal('0.5'), Decimal(os.getenv('MIN_NET_PROFIT_PCT', '0.5')))
+TRADE = Decimal('50')
+RESERVE = Decimal('50')
+PRICE_BUFFER_PCT = Decimal('0.20')
 COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SEC', '1800'))
 SCAN = int(os.getenv('SCAN_INTERVAL_SEC', '20'))
 MAX_CANDIDATES = int(os.getenv('MAX_CANDIDATES_PER_SCAN', '10'))
 last_alert = {}
 cache = {}
+api_blocked_until = {}
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -44,7 +47,21 @@ def positive(value):
 
 
 def get_json(url, **kwargs):
+    parsed = urlparse(url)
+    host_key = parsed.netloc
+    path_key = (parsed.netloc, parsed.path)
+    now = time.monotonic()
+    if now < max(api_blocked_until.get(host_key, 0), api_blocked_until.get(path_key, 0)):
+        raise RuntimeError('Exchange API temporarily unavailable')
     response = requests.get(url, timeout=10, **kwargs)
+    if response.status_code in (401, 403, 418, 429):
+        retry = response.headers.get('Retry-After', '')
+        base_delay = 3600 if response.status_code in (401, 403, 418) else 60
+        delay = max(base_delay, int(retry)) if retry.isdigit() else base_delay
+        block_key = host_key if response.status_code in (418, 429) else path_key
+        api_blocked_until[block_key] = time.monotonic() + delay
+        logging.warning('Exchange API HTTP %s at %s%s; paused %ss',
+                        response.status_code, parsed.netloc, parsed.path, delay)
     response.raise_for_status()
     return response.json()
 
@@ -295,14 +312,22 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
         # Return the USDT to the buying exchange so a repeatable cycle is priced.
         usdt_routes = chain_options(networks(sell, 'USDT'), networks(buy, 'USDT'), sell, after_trade)
         for usdt_net, final_usdt, usdt_cost in usdt_routes:
-            profit = final_usdt - TRADE
+            price_buffer = TRADE * PRICE_BUFFER_PCT / 100
+            profit = final_usdt - TRADE - price_buffer
             net = profit / TRADE * 100
             if best is None or net > best['net']:
                 gross = (top_bid / top_ask - 1) * 100
+                buy_vwap = TRADE / base
+                sell_vwap = proceeds / sell_qty
+                buy_slippage = max(Decimal(0), TRADE - base * top_ask)
+                sell_slippage = max(Decimal(0), sell_qty * top_bid - proceeds)
                 best = dict(symbol=symbol, buy=buy, sell=sell, net=net, profit=profit,
                             gross=gross, coin_net=coin_net, usdt_net=usdt_net,
                             coin_cost=coin_cost, usdt_cost=usdt_cost,
-                            buy_fee=buy_rate * 100, sell_fee=sell_rate * 100)
+                            buy_fee=buy_rate * 100, sell_fee=sell_rate * 100,
+                            buy_price=buy_vwap, sell_price=sell_vwap,
+                            buy_slippage=buy_slippage, sell_slippage=sell_slippage,
+                            price_buffer=price_buffer)
     return best
 
 
@@ -334,14 +359,21 @@ def scan_once():
         key = (item['symbol'], item['buy'], item['sell'])
         if now - last_alert.get(key, 0) < COOLDOWN:
             continue
-        text = (f"🔥 {item['symbol']} — расчётная чистая прибыль {item['net']:.2f}%"
-                f" (≈ ${item['profit']:.2f} на ${TRADE:.0f})\n"
-                f"Купить: {item['buy']} → продать: {item['sell']}\n"
-                f"Монета: сеть {item['coin_net']}, вывод {item['coin_cost']:.8g} {item['symbol'][:-4]}\n"
-                f"Возврат USDT: сеть {item['usdt_net']}, вывод {item['usdt_cost']:.4f} USDT\n"
-                f"Торговые комиссии: {item['buy_fee']:.3f}% / {item['sell_fee']:.3f}%\n"
-                f"Спред лучших цен: {item['gross']:.2f}%; исполнение рассчитано по глубине стаканов.\n"
-                "Оценка на текущем стакане, цена и доступность вывода могут измениться до сделки.")
+        text = (f"🔥 {item['symbol']} — купить {item['buy']} → продать {item['sell']}\n"
+                f"Сделка: {TRADE:.0f} USDT; резерв: {RESERVE:.0f} USDT на каждой бирже.\n"
+                f"Цена по глубине: покупка {item['buy_price']:.8g}, продажа {item['sell_price']:.8g} USDT.\n"
+                f"Исходный спред лучших цен: {item['gross']:.2f}%.\n"
+                f"Торговые комиссии (taker): {item['buy_fee']:.3f}% / {item['sell_fee']:.3f}%.\n"
+                f"Монета: сеть {item['coin_net']}, вывод и зачисление {item['coin_cost']:.8g} {item['symbol'][:-4]}.\n"
+                f"Возврат USDT: сеть {item['usdt_net']}, вывод и зачисление {item['usdt_cost']:.4f} USDT.\n"
+                f"Проскальзывание по стаканам: {item['buy_slippage']:.4f} + "
+                f"{item['sell_slippage']:.4f} USDT (уже включено в цены).\n"
+                f"Защитный резерв на изменение цены: {PRICE_BUFFER_PCT:.2f}% "
+                f"({item['price_buffer']:.2f} USDT).\n"
+                f"Итог после всех расходов и резерва: {item['net']:.2f}% "
+                f"(≈ {item['profit']:.2f} USDT).\n"
+                "Последовательный перевод монеты и возврат USDT; цены и доступность сети могут измениться. "
+                "Уведомление, без автоматических сделок.")
         telegram(text)
         last_alert[key] = now
     return found
@@ -376,6 +408,8 @@ def basis_loop():
 @app.get('/')
 def home():
     return {'status': 'ok', 'scanner': 'Binance-Gate', 'min_net_profit_pct': float(THRESH),
+            'trade_usdt': float(TRADE), 'reserve_usdt_per_exchange': float(RESERVE),
+            'price_buffer_pct': float(PRICE_BUFFER_PCT),
             'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)),
             'basis_mode': 'read-only', 'basis_leg_usdt': float(basis.LEG_USDT),
             'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT)}

@@ -11,7 +11,8 @@ RESERVE_USDT = Decimal(os.getenv('BASIS_RESERVE_USDT', '50'))
 EXIT_SLIPPAGE = Decimal(os.getenv('BASIS_EXIT_SLIPPAGE_PCT', '0.30')) / 100
 MAX_FUNDING_INTERVALS = int(os.getenv('BASIS_FUNDING_INTERVALS', '1'))
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
-MIN_BASIS_NET = Decimal(os.getenv('BASIS_MIN_CONVERGENCE_PCT', '0.5'))
+MIN_BASIS_NET = max(Decimal('0.5'), Decimal(os.getenv('BASIS_MIN_CONVERGENCE_PCT', '0.5')))
+PRICE_BUFFER_PCT = Decimal('0.20')
 last_alert = {}
 api_blocked_until = {}
 
@@ -163,7 +164,8 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     cover = quantity * price * (1 + EXIT_SLIPPAGE)
     open_fee = short_proceeds * perp_fee
     close_fee = cover * perp_fee
-    projected = spot_exit + short_proceeds - cover - cost - open_fee - close_fee - funding_debit
+    price_buffer = cost * PRICE_BUFFER_PCT / 100
+    projected = spot_exit + short_proceeds - cover - cost - open_fee - close_fee - funding_debit - price_buffer
     pct = projected / cost * 100
     return {'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
             'quantity': quantity, 'spot_entry': cost / acquired,
@@ -171,7 +173,7 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
             'future_notional': short_proceeds, 'spot_exit': price * (1 - EXIT_SLIPPAGE),
             'future_exit': price * (1 + EXIT_SLIPPAGE), 'projected': projected,
             'pct': pct, 'spot_fee': buy_fee, 'future_fee': perp_fee,
-            'funding': funding, 'funding_debit': funding_debit,
+            'funding': funding, 'funding_debit': funding_debit, 'price_buffer': price_buffer,
             'reserve': RESERVE_USDT}
 
 
@@ -234,7 +236,8 @@ def format_alert(x):
             f"Комиссии спот/фьючерс за сторону: {x['spot_fee']*100:.3f}% / "
             f"{x['future_fee']*100:.3f}%; учтены 4 сделки, проскальзывание "
             f"{EXIT_SLIPPAGE*100:.2f}% на каждой стороне выхода и возможная плата "
-            f"funding ≈ {x['funding_debit']:.3f} USDT.\n"
+            f"funding ≈ {x['funding_debit']:.3f} USDT; дополнительный защитный резерв "
+            f"{PRICE_BUFFER_PCT:.2f}% (≈ {x['price_buffer']:.2f} USDT).\n"
             f"Разместить примерно по {LEG_USDT:.0f} USDT на споте и в залоге фьючерса "
             f"плюс по {x['reserve']:.0f} USDT резерва на каждой бирже. "
             "Баланс, маржа и риск ликвидации не проверены. "

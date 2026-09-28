@@ -9,7 +9,7 @@ services:
       - key: MIN_NET_PROFIT_PCT
         value: "0.5"
       - key: TRADE_USDT
-        value: "1000"
+        value: "50"
       - key: SCAN_INTERVAL_SEC
         value: "20"
       - key: BINANCE_API_KEY

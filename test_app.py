@@ -34,16 +34,47 @@ class CostTests(unittest.TestCase):
     def test_net_uses_both_books_both_trades_and_both_networks(self):
         books = {'Binance': ([['10', '50'], ['11', '100']], []),
                  'Gate': ([], [['12', '100']])}
-        route = [('ETH', D('94'), D('1'))]
-        return_route = [('TRX', D('1126'), D('1'))]
+        route = [('ETH', D('4.9'), D('0.05'))]
+        return_route = [('TRX', D('57.212'), D('1'))]
         with patch.object(app, 'orderbook', side_effect=lambda ex, _: books[ex]), \
              patch.object(app, 'fee', return_value=D('0.01')), \
              patch.object(app, 'networks', return_value=[]), \
              patch.object(app, 'chain_options', side_effect=[route, return_route]):
             result = app.estimate('ABCUSDT', 'Binance', 'Gate', D('10'), D('12'))
-        # First $500 buys 50, next $500 buys 45.4545; fee and transfer are mocked.
-        self.assertEqual(result['profit'], D('126'))
-        self.assertEqual(result['net'], D('12.6'))
+        # $50 buys 5 units, then fees, both transfers and $0.10 buffer.
+        self.assertEqual(result['profit'], D('7.112'))
+        self.assertEqual(result['net'], D('14.224'))
+        self.assertEqual(result['price_buffer'], D('0.10'))
+        self.assertEqual(result['buy_price'], D('10'))
+        self.assertEqual(result['sell_price'], D('12'))
+
+    def test_depth_slippage_and_extra_buffer_are_not_double_counted(self):
+        books = {'Binance': ([['10', '2'], ['11', '10']], []),
+                 'Gate': ([], [['12', '2'], ['11', '10']])}
+        with patch.object(app, 'orderbook', side_effect=lambda ex, _: books[ex]), \
+             patch.object(app, 'fee', return_value=D('0')), \
+             patch.object(app, 'networks', return_value=[]), \
+             patch.object(app, 'chain_options', side_effect=lambda _s, _d, ex, amount:
+                          [('ETH', amount, D('0'))] if ex == 'Binance'
+                          else [('TRX', amount, D('0'))]):
+            result = app.estimate('ABCUSDT', 'Binance', 'Gate', D('10'), D('12'))
+        self.assertGreater(result['buy_slippage'], 0)
+        self.assertGreater(result['sell_slippage'], 0)
+        self.assertAlmostEqual(result['profit'], result['sell_price'] * (D('2') + D('30') / D('11'))
+                               - D('50') - D('0.10'), places=10)
+
+    def test_http_418_respects_retry_after_and_stops_repeat_calls(self):
+        response = unittest.mock.Mock(status_code=418, headers={'Retry-After': '7200'})
+        response.raise_for_status.side_effect = __import__('requests').HTTPError(response=response)
+        with patch.object(app.requests, 'get', return_value=response) as get, \
+             patch.object(app.time, 'monotonic', return_value=100):
+            with self.assertRaises(__import__('requests').HTTPError):
+                app.get_json('https://fapi.binance.com/fapi/v1/commissionRate')
+            self.assertEqual(app.api_blocked_until['fapi.binance.com'], 7300)
+            with self.assertRaises(RuntimeError):
+                app.get_json('https://fapi.binance.com/fapi/v1/commissionRate')
+            get.assert_called_once()
+        app.api_blocked_until.clear()
 
     def test_no_api_keys_means_no_unverified_alerts(self):
         with patch.object(app, 'BINANCE_KEY', ''), patch.object(app, 'tickers') as tickers:
