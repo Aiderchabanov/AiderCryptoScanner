@@ -4,12 +4,12 @@ import logging
 import os
 import time
 from decimal import Decimal, ROUND_DOWN
+import paper
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
 LEG_USDT = Decimal('50')
 RESERVE_USDT = Decimal('50')
 EXIT_SLIPPAGE = Decimal(os.getenv('BASIS_EXIT_SLIPPAGE_PCT', '0.30')) / 100
-MAX_FUNDING_INTERVALS = int(os.getenv('BASIS_FUNDING_INTERVALS', '1'))
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
 MIN_BASIS_NET = max(Decimal('0.5'), Decimal(os.getenv('BASIS_MIN_CONVERGENCE_PCT', '0.5')))
 PRICE_BUFFER_PCT = Decimal('0.20')
@@ -99,7 +99,7 @@ def futures_fee(api, exchange, symbol):
         if value is None or not 0 <= value < 1:
             raise ValueError('Personal futures fee unavailable')
         return value
-    return api.cached(('basis-futures-fee', exchange, symbol), 3600, load)
+    return api.cached(('basis-futures-fee', exchange, symbol), 60, load)
 
 
 def futures_book(api, exchange, symbol, multiplier):
@@ -127,6 +127,16 @@ def spot_cost(asks, quantity, api):
     return None
 
 
+def funding_expense(rate, direction, notional, crosses):
+    if not crosses:
+        return Decimal(0)
+    if direction not in ('short', 'long'):
+        raise ValueError('Unknown futures direction')
+    # Positive funding is paid by longs; negative funding is paid by shorts.
+    signed_cost = rate if direction == 'long' else -rate
+    return max(signed_cost, Decimal(0)) * notional
+
+
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     meta = futures_meta(api, future_exchange, symbol)
     buy_fee = api.fee(spot_exchange, symbol)
@@ -147,18 +157,28 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     short_proceeds = api.sell_for_usdt(bids, quantity)
     if cost is None or short_proceeds is None or cost > LEG_USDT or short_proceeds > LEG_USDT:
         return None
-    min_spot_qty, min_spot_value = spot_minimum(api, spot_exchange, symbol)
-    if acquired < min_spot_qty or cost < min_spot_value or short_proceeds < meta['min_notional']:
+    rules = api.spot_rules(spot_exchange, symbol, 'buy')
+    if not api.order_size_ok(rules, acquired, cost) or short_proceeds < meta['min_notional']:
         return None
     if cost < LEG_USDT * Decimal('0.8') or short_proceeds < LEG_USDT * Decimal('0.8'):
         return None
-    funding = api.dec(funding_hint) if funding_hint is not None else meta['funding']
+    funding = None
+    next_funding = None
     if future_exchange == 'Binance':
         premium = api.get_json(FUTURES_BINANCE + '/fapi/v1/premiumIndex', params={'symbol': symbol})
         funding = api.dec(premium.get('lastFundingRate'))
-    if funding is None or abs(funding) > Decimal('0.1'):
-        return None
-    funding_debit = max(-funding, Decimal(0)) * short_proceeds * MAX_FUNDING_INTERVALS
+        millis = api.dec(premium.get('nextFundingTime'))
+        next_funding = float(millis / 1000) if millis is not None else None
+    else:
+        current = api.gate('/futures/usdt/contracts/' + symbol[:-4] + '_USDT')
+        funding = api.dec(current.get('funding_rate_next') or current.get('funding_rate'))
+        next_funding = float(api.dec(current.get('funding_next_apply'))) if api.dec(current.get('funding_next_apply')) is not None else None
+    now = time.time()
+    if funding is None or abs(funding) > Decimal('0.1') or next_funding is None or next_funding <= now:
+        raise ValueError('Current funding rate or next settlement unavailable')
+    crosses_funding = next_funding <= now + 60 * 60
+    # Short pays negative funding; a possible positive receipt is not booked.
+    funding_debit = funding_expense(funding, 'short', short_proceeds, crosses_funding)
     price = spot_ask
     spot_exit = quantity * price * (1 - EXIT_SLIPPAGE) * (1 - buy_fee)
     cover = quantity * price * (1 + EXIT_SLIPPAGE)
@@ -173,11 +193,19 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
             'future_notional': short_proceeds, 'spot_exit': price * (1 - EXIT_SLIPPAGE),
             'future_exit': price * (1 + EXIT_SLIPPAGE), 'projected': projected,
             'pct': pct, 'spot_fee': buy_fee, 'future_fee': perp_fee,
-            'funding': funding, 'funding_debit': funding_debit, 'price_buffer': price_buffer,
+            'funding': funding, 'next_funding_at': next_funding,
+            'funding_crosses_60m': crosses_funding, 'funding_filtered': funding_debit > 0,
+            'funding_debit': funding_debit, 'price_buffer': price_buffer,
+            'spot_ask': spot_ask, 'future_bid': perp_bid,
+            'spot_slippage_usdt': max(Decimal(0), cost - acquired * spot_ask),
+            'futures_slippage_usdt': max(Decimal(0), quantity * perp_bid - short_proceeds),
+            'multiplier': meta['multiplier'],
             'reserve': RESERVE_USDT}
 
 
 def scan(api):
+    if not paper.storage_ready():
+        return []  # Never alert without durable episode/checkpoint records.
     if not all((api.BINANCE_KEY, api.BINANCE_SECRET, api.GATE_KEY, api.GATE_SECRET)):
         return []
     spots = api.tickers()
@@ -202,8 +230,11 @@ def scan(api):
             continue
         try:
             item = evaluate(api, symbol, spot, future, funding)
-            if item and item['pct'] >= MIN_BASIS_NET:
+            if item and item['pct'] >= MIN_BASIS_NET and not item['funding_filtered']:
                 found.append(item)
+            elif item and item['funding_filtered']:
+                logging.info('Basis %s %s/%s filtered: short funding expense before +60m',
+                             symbol, spot, future)
         except Exception as exc:
             response = getattr(exc, 'response', None)
             status = getattr(response, 'status_code', None)
@@ -218,10 +249,15 @@ def scan(api):
     now = time.time()
     for item in found[:3]:
         key = ('basis', item['symbol'], item['spot'], item['future'])
-        if now - last_alert.get(key, 0) < api.COOLDOWN:
-            continue
-        api.telegram(format_alert(item))
-        last_alert[key] = now
+        try:
+            episode_id = paper.record(item)
+            if episode_id is None:
+                continue  # Same continuous spread episode.
+            api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol']))
+            last_alert[key] = now
+        except Exception as exc:
+            logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
+                            type(exc).__name__)
     return found
 
 
@@ -236,7 +272,9 @@ def format_alert(x):
             f"Комиссии спот/фьючерс за сторону: {x['spot_fee']*100:.3f}% / "
             f"{x['future_fee']*100:.3f}%; учтены 4 сделки, проскальзывание "
             f"{EXIT_SLIPPAGE*100:.2f}% на каждой стороне выхода и возможная плата "
-            f"funding ≈ {x['funding_debit']:.3f} USDT; дополнительный защитный резерв "
+            f"funding ≈ {x['funding_debit']:.3f} USDT (short, ставка {x['funding']*100:.4f}%, "
+            f"следующий расчёт {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(x['next_funding_at']))}; "
+            "выплата лишь если позиция останется открыта к этому времени); дополнительный защитный резерв "
             f"{PRICE_BUFFER_PCT:.2f}% (≈ {x['price_buffer']:.2f} USDT).\n"
             f"Разместить примерно по {LEG_USDT:.0f} USDT на споте и в залоге фьючерса "
             f"плюс по {x['reserve']:.0f} USDT резерва на каждой бирже. "

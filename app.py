@@ -10,6 +10,7 @@ from urllib.parse import urlencode, urlparse
 import requests
 from flask import Flask
 import basis
+import paper
 
 BINANCE = 'https://api.binance.com'
 GATE = 'https://api.gateio.ws/api/v4'
@@ -503,6 +504,16 @@ def basis_loop():
         time.sleep(max(60, SCAN))
 
 
+def paper_loop():
+    while True:
+        try:
+            if paper.storage_ready():
+                paper.poll(__import__(__name__))
+        except Exception:
+            logging.exception('Virtual checkpoints unavailable; no historical price substituted')
+        time.sleep(min(SCAN, 20))
+
+
 
 
 
@@ -513,7 +524,8 @@ def home():
             'price_buffer_pct': float(PRICE_BUFFER_PCT),
             'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)),
             'basis_mode': 'read-only', 'basis_leg_usdt': float(basis.LEG_USDT),
-            'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT)}
+            'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT),
+            'paper_storage_ready': paper.storage_ready()}
 
 
 def telegram_updates():
@@ -536,6 +548,14 @@ def telegram_updates():
                 if command and command[0].split('@')[0] == '/start' and chat_id:
                     telegram(f'✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ {THRESH}% по Binance ↔ Gate.', chat_id)
                     logging.info('Telegram /start answered')
+                if command and command[0].split('@')[0] == '/stats' and chat_id and str(chat_id) == str(CHAT_ID):
+                    try:
+                        symbol = command[1].strip().upper() if len(command) > 1 else None
+                        if symbol and not symbol.endswith('USDT'):
+                            symbol += 'USDT'
+                        telegram(paper.stats_line(symbol=symbol), chat_id)
+                    except Exception:
+                        telegram('История пока недоступна: постоянное хранилище не подключено.', chat_id)
                 offset = update['update_id'] + 1
         except Exception as exc:
             logging.error('telegram updates failed: %s', type(exc).__name__)
@@ -561,8 +581,11 @@ def log_webhook_owner():
 
 
 if __name__ == '__main__':
+    if not paper.storage_ready():
+        logging.warning('Virtual episode storage unavailable: Spot/Futures alerts paused')
     threading.Thread(target=loop, daemon=True).start()
     threading.Thread(target=basis_loop, daemon=True).start()
+    threading.Thread(target=paper_loop, daemon=True).start()
     if log_webhook_owner():
         threading.Thread(target=telegram_updates, daemon=True).start()
     else:

@@ -22,3 +22,52 @@ Optional settings: `MIN_NET_PROFIT_PCT=0.5`, `SCAN_INTERVAL_SEC=20`, `ALERT_COOL
 ## Tests
 
 `python -m unittest discover -v`
+
+## Virtual Spot/Futures episodes
+
+The existing spot scanner keeps its $50 position, $50 reserve, network-cost,
+orderbook, fee and 0.20% buffer filters. The read-only spot/perpetual scanner
+uses a maximum $50 on each leg and another $50 reserve on each exchange. A
+new qualified basis signal is saved as a virtual episode before its Telegram
+message is sent. Repeated signals for the same coin and direction during one
+continuous episode do not increase the sample count. After an observed
+spread ≤0.10%, a new episode may start. Otherwise the cooldown is two hours.
+
+The virtual module samples fresh spot asks and futures bids and their depth at
++1, +5, +15, +30 and +60 minutes. It measures matched base quantity, the
+same size as the opening virtual position (at most $50 per leg), and stores
+raw best-price and executable VWAP spreads. If a checkpoint is missed by more
+than one minute, it is explicitly marked `missing`, never reconstructed from
+last price or current books. The first **observed checkpoint** ≤0.10% is the
+closure time; this is a sampling estimate, not proof of an exact crossing
+between checkpoints. An episode with five observed checkpoints and no closure
+is `not_closed_60m`; incomplete episodes are excluded from closing-rate
+denominators. Statistics report the percentages closed by each checkpoint,
+median and mean first-observed closure, and fraction not closed by 60 minutes.
+Coin history is displayed in new basis alerts after 30 complete observations;
+below that it says `недостаточно истории`. `/stats` shows scanner-wide results
+and `/stats HBAR` one coin in the configured Telegram chat.
+
+Funding is read again for the specific futures contract and next funding time.
+For a short, a negative estimated rate is a possible expense if next funding
+falls within the 60-minute observation horizon and filters the alert. Positive
+funding is never counted as guaranteed income. A settlement after the horizon
+adds no funding cost. Funding can change; projected convergence and exit
+slippage remain estimates, not guaranteed trading profits. No order or
+withdrawal endpoint is called.
+
+Storage schema (SQLite):
+
+| Table | Contents |
+| --- | --- |
+| `episodes` | Coin, spot/futures venues and direction, UTC signal time, target $50, actual leg notionals and size, best and depth prices, raw and executable spread, fee/cost snapshot JSON, funding rate and next timestamp, net model, lowest observed spread, first closure checkpoint, status. |
+| `checkpoints` | Episode ID, due and actual times, 1/5/15/30/60-minute horizon, observed or missing status, best and depth prices, both spreads, reduction in percentage points and relative percentage, missing-data reason. |
+
+**Render persistence:** Set `PAPER_DB_PATH=/var/data/scanner.sqlite3` only after
+attaching a real persistent disk mounted at `/var/data`. The code checks that
+the mount exists. Render's Free web service has an ephemeral filesystem and
+cannot attach a persistent disk. Until durable storage is available, basis
+alerts and virtual tracking are paused; the existing spot cycle continues.
+No database secret is needed for this disk-backed SQLite option. A short local
+test can set `PAPER_DB_PATH` to a temporary file; it does not prove production
+persistence. Backups are still prudent, especially before schema changes.
