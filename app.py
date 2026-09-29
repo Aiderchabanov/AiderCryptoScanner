@@ -75,8 +75,17 @@ def get_json(url, **kwargs):
                 paper.save_api_backoff(host_key, time.time() + delay)
             except Exception:
                 logging.warning('Binance futures backoff could not be persisted')
-        logging.warning('Exchange API HTTP %s at %s%s; paused %ss',
-                        response.status_code, parsed.netloc, parsed.path, delay)
+        error_label = ''
+        if host_key == 'api.gateio.ws' and response.status_code == 401:
+            try:
+                label = response.json().get('label', '')
+                if (isinstance(label, str) and label.isascii() and
+                        label.replace('_', '').isalnum() and len(label) <= 64):
+                    error_label = f' label={label}'
+            except (ValueError, AttributeError):
+                pass
+        logging.warning('Exchange API HTTP %s%s at %s%s; paused %ss',
+                        response.status_code, error_label, parsed.netloc, parsed.path, delay)
     response.raise_for_status()
     return response.json()
 
