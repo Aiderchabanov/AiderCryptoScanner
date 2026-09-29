@@ -8,6 +8,36 @@ import basis
 
 
 class BasisTests(unittest.TestCase):
+    def test_blocked_binance_futures_does_not_hide_gate_markets(self):
+        with patch.object(app, 'get_json', side_effect=RuntimeError('paused')), \
+             patch.object(app, 'gate', return_value=[{'contract': 'ABC_USDT',
+                                                       'highest_bid': '10.3'}]):
+            binance, gate = basis.futures_markets(app)
+        self.assertEqual(binance, {})
+        self.assertEqual(gate['ABCUSDT']['highest_bid'], '10.3')
+
+    def test_gate_futures_fee_uses_live_personal_wallet_rate_on_403(self):
+        def gate(path, params=None, signed=False):
+            if path == '/futures/usdt/fee':
+                raise RuntimeError('HTTP 403')
+            self.assertEqual(path, '/wallet/fee')
+            self.assertEqual(params, {'currency_pair': 'ABC_USDT', 'settle': 'USDT'})
+            self.assertTrue(signed)
+            return {'futures_taker_fee': '0.0005'}
+        with patch.object(app, 'gate', side_effect=gate), \
+             patch.object(app, 'cached', side_effect=lambda key, ttl, load: load()):
+            self.assertEqual(basis.futures_fee(app, 'Gate', 'ABCUSDT'), D('0.0005'))
+
+    def test_gate_futures_fee_missing_from_both_apis_fails_closed(self):
+        def gate(path, params=None, signed=False):
+            if path == '/futures/usdt/fee':
+                raise RuntimeError('HTTP 403')
+            return {'taker_fee': '0.001'}  # A spot fee is not a futures fee.
+        with patch.object(app, 'gate', side_effect=gate), \
+             patch.object(app, 'cached', side_effect=lambda key, ttl, load: load()):
+            with self.assertRaises(ValueError):
+                basis.futures_fee(app, 'Gate', 'ABCUSDT')
+
     def test_funding_direction(self):
         self.assertEqual(basis.funding_expense(D('-0.001'), 'short', D('50'), True), D('0.050'))
         self.assertEqual(basis.funding_expense(D('0.001'), 'long', D('50'), True), D('0.050'))
