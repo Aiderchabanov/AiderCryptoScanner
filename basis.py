@@ -105,20 +105,13 @@ def futures_fee(api, exchange, symbol):
             value = api.dec(row.get('takerCommissionRate'))
         else:
             contract = symbol[:-4] + '_USDT'
-            try:
-                row = api.gate('/futures/usdt/fee', {'contract': contract}, True)
-                if isinstance(row, dict) and contract in row:
-                    row = row[contract]
-                value = api.dec(row.get('taker_fee')) if isinstance(row, dict) else None
-            except Exception:
-                value = None
-            if value is None:
-                # Gate's authenticated personal fee API also reports the
-                # futures taker rate for the requested USDT settlement.
-                row = api.gate('/wallet/fee', {'currency_pair': contract,
-                                               'settle': 'USDT'}, True)
-                value = api.dec(row.get('futures_taker_fee')) if isinstance(row, dict) else None
-        if value is None or not 0 <= value < 1:
+            # Gate documents this authenticated endpoint for the personal
+            # perpetual taker rate. The separate futures fee path returned 403
+            # for this account and must not be retried before every scan.
+            row = api.gate('/wallet/fee', {'currency_pair': contract,
+                                           'settle': 'USDT'}, True)
+            value = api.dec(row.get('futures_taker_fee')) if isinstance(row, dict) else None
+alue is None or not 0 <= value < 1:
             raise ValueError('Personal futures fee unavailable')
         return value
     return api.cached(('basis-futures-fee', exchange, symbol), 60, load)
