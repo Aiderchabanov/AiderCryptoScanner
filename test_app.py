@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import unittest
 from decimal import Decimal as D
 from unittest.mock import patch
@@ -10,6 +12,21 @@ RULES = {'min_qty': D('0.01'), 'min_quote': D('1'), 'max_qty': None,
 
 
 class CostTests(unittest.TestCase):
+    def test_gate_signs_unencoded_unicode_query(self):
+        pair = '币安人生_USDT'
+        with patch.object(app, 'GATE_KEY', 'key'), \
+             patch.object(app, 'GATE_SECRET', 'secret'), \
+             patch.object(app.time, 'time', return_value=1541993715), \
+             patch.object(app, 'get_json', return_value={}) as get:
+            app.gate('/wallet/fee', {'currency_pair': pair}, True)
+        args, kwargs = get.call_args
+        self.assertEqual(kwargs['params'], {'currency_pair': pair})
+        message = '\n'.join(('GET', '/api/v4/wallet/fee',
+                             'currency_pair=币安人生_USDT',
+                             hashlib.sha512(b'').hexdigest(), '1541993715'))
+        expected = hmac.new(b'secret', message.encode(), hashlib.sha512).hexdigest()
+        self.assertEqual(kwargs['headers']['SIGN'], expected)
+
     def test_depth_requires_full_fill(self):
         self.assertIsNone(app.buy_for_usdt([['10', '1']], D('100')))
         self.assertIsNone(app.sell_for_usdt([['12', '1']], D('2')))
