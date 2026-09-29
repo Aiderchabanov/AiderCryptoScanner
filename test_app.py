@@ -73,7 +73,10 @@ class CostTests(unittest.TestCase):
         response = unittest.mock.Mock(status_code=418, headers={'Retry-After': '7200'})
         response.raise_for_status.side_effect = __import__('requests').HTTPError(response=response)
         with patch.object(app.requests, 'get', return_value=response) as get, \
-             patch.object(app.time, 'monotonic', return_value=100):
+             patch.object(app.time, 'monotonic', return_value=100), \
+             patch.object(app.paper, 'load_api_backoff', return_value=0), \
+             patch.object(app.paper, 'save_api_backoff'):
+            app.api_blocked_until.clear()
             with self.assertRaises(__import__('requests').HTTPError):
                 app.get_json('https://fapi.binance.com/fapi/v1/commissionRate')
             self.assertEqual(app.api_blocked_until['fapi.binance.com'], 7300)
