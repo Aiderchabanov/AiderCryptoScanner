@@ -52,6 +52,15 @@ def get_json(url, **kwargs):
     host_key = parsed.netloc
     path_key = (parsed.netloc, parsed.path)
     now = time.monotonic()
+    if host_key == 'fapi.binance.com' and host_key not in api_blocked_until:
+        try:
+            until = paper.load_api_backoff(host_key)
+            api_blocked_until[host_key] = max(now, now + until - time.time())
+        except Exception:
+            # A missing paper database already prevents basis alerts. Keep
+            # the spot scanner independent of that database.
+            logging.warning('Binance futures backoff storage unavailable')
+            api_blocked_until[host_key] = now + 3600
     if now < max(api_blocked_until.get(host_key, 0), api_blocked_until.get(path_key, 0)):
         raise RuntimeError('Exchange API temporarily unavailable')
     response = requests.get(url, timeout=10, **kwargs)
@@ -61,6 +70,11 @@ def get_json(url, **kwargs):
         delay = max(base_delay, int(retry)) if retry.isdigit() else base_delay
         block_key = host_key if response.status_code in (418, 429) else path_key
         api_blocked_until[block_key] = time.monotonic() + delay
+        if host_key == 'fapi.binance.com' and response.status_code in (418, 429):
+            try:
+                paper.save_api_backoff(host_key, time.time() + delay)
+            except Exception:
+                logging.warning('Binance futures backoff could not be persisted')
         logging.warning('Exchange API HTTP %s at %s%s; paused %ss',
                         response.status_code, parsed.netloc, parsed.path, delay)
     response.raise_for_status()
