@@ -16,10 +16,8 @@ class BasisTests(unittest.TestCase):
         self.assertEqual(binance, {})
         self.assertEqual(gate['ABCUSDT']['highest_bid'], '10.3')
 
-    def test_gate_futures_fee_uses_live_personal_wallet_rate_on_403(self):
+    def test_gate_futures_fee_uses_live_personal_wallet_rate_without_forbidden_request(self):
         def gate(path, params=None, signed=False):
-            if path == '/futures/usdt/fee':
-                raise RuntimeError('HTTP 403')
             self.assertEqual(path, '/wallet/fee')
             self.assertEqual(params, {'currency_pair': 'ABC_USDT', 'settle': 'USDT'})
             self.assertTrue(signed)
@@ -28,15 +26,33 @@ class BasisTests(unittest.TestCase):
              patch.object(app, 'cached', side_effect=lambda key, ttl, load: load()):
             self.assertEqual(basis.futures_fee(app, 'Gate', 'ABCUSDT'), D('0.0005'))
 
-    def test_gate_futures_fee_missing_from_both_apis_fails_closed(self):
+    def test_gate_futures_fee_missing_from_wallet_fails_closed(self):
         def gate(path, params=None, signed=False):
-            if path == '/futures/usdt/fee':
-                raise RuntimeError('HTTP 403')
+            self.assertEqual(path, '/wallet/fee')
             return {'taker_fee': '0.001'}  # A spot fee is not a futures fee.
         with patch.object(app, 'gate', side_effect=gate), \
              patch.object(app, 'cached', side_effect=lambda key, ttl, load: load()):
             with self.assertRaises(ValueError):
                 basis.futures_fee(app, 'Gate', 'ABCUSDT')
+
+    def test_binance_retry_after_persists_across_process_caches(self):
+        response = Mock(status_code=418, headers={'Retry-After': '7200'})
+        response.raise_for_status.side_effect = RuntimeError('418')
+        with patch.object(app.paper, 'load_api_backoff', return_value=0) as load, \
+             patch.object(app.paper, 'save_api_backoff') as save, \
+             patch.object(app.requests, 'get', return_value=response) as request:
+            app.api_blocked_until.clear()
+            with self.assertRaises(RuntimeError):
+                app.get_json('https://fapi.binance.com/fapi/v1/ticker/bookTicker')
+            load.assert_called_once_with('fapi.binance.com')
+            self.assertEqual(save.call_args.args[0], 'fapi.binance.com')
+            self.assertGreater(save.call_args.args[1], time.time() + 7000)
+            app.api_blocked_until.clear()
+            load.return_value = time.time() + 7000
+            with self.assertRaisesRegex(RuntimeError, 'temporarily unavailable'):
+                app.get_json('https://fapi.binance.com/fapi/v1/depth')
+            request.assert_called_once()
+        app.api_blocked_until.clear()
 
     def test_funding_direction(self):
         self.assertEqual(basis.funding_expense(D('-0.001'), 'short', D('50'), True), D('0.050'))
