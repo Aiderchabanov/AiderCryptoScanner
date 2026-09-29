@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     PRIMARY KEY (episode_id, horizon_min)
 );
 CREATE INDEX IF NOT EXISTS checkpoint_due ON checkpoints(status, due_at);
+CREATE TABLE IF NOT EXISTS api_backoff (
+    host TEXT PRIMARY KEY,
+    until_at DOUBLE PRECISION NOT NULL
+);
 '''
 
 
