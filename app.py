@@ -129,7 +129,7 @@ def binance_signed_params(params):
 
 
 def gate(path, params=None, signed=False):
-    query = urlencode(params or {})
+    query = '&'.join(f'{key}={value}' for key, value in (params or {}).items())
     headers = {}
     if signed:
         if not GATE_KEY or not GATE_SECRET:
