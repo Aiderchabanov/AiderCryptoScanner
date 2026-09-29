@@ -148,6 +148,23 @@ def first_value(row):
     return next(iter(row.values())) if isinstance(row, dict) else row[0]
 
 
+def load_api_backoff(host):
+    """Read a host ban deadline across deploys, without storing credentials."""
+    with session() as db:
+        row = db.execute('SELECT until_at FROM api_backoff WHERE host=?', (host,)).fetchone()
+        return float(first_value(row)) if row else 0
+
+
+def save_api_backoff(host, until_at):
+    with session() as db:
+        db.execute('''INSERT INTO api_backoff (host, until_at) VALUES (?, ?)
+            ON CONFLICT (host) DO UPDATE SET until_at=excluded.until_at
+            WHERE api_backoff.until_at < excluded.until_at''', (host, until_at))
+
+
+
+
+
 def record(item, path=None, at=None):
     """Create one episode for a qualified alert; return its ID or None."""
     now = time.time() if at is None else at
