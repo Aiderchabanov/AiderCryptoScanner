@@ -110,8 +110,8 @@ def futures_fee(api, exchange, symbol):
             # for this account and must not be retried before every scan.
             row = api.gate('/wallet/fee', {'currency_pair': contract,
                                            'settle': 'USDT'}, True)
-            value = api.dec(row.get('futures_taker_fee')) if isinstance(row, dict) else None
-alue is None or not 0 <= value < 1:
+            value = api.dec(row.get('futures_taker_fee')) if isinstance(row, dict) else None                
+        if value is None or not 0 <= value < 1:
             raise ValueError('Personal futures fee unavailable')
         return value
     return api.cached(('basis-futures-fee', exchange, symbol), 60, load)
