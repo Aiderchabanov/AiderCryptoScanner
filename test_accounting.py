@@ -48,6 +48,22 @@ class AccountingTests(unittest.TestCase):
             db.execute('UPDATE virtual_state SET close_json=?',(json.dumps(self.complete_quote('9')),))
         self.assertEqual(virtual.accounting(self.path)['incomplete_closed_pnl_count'],1)
 
+    def test_saved_legacy_complete_normalized_without_inventing_data(self):
+        with paper.session(self.path) as db:
+            db.execute("UPDATE virtual_state SET state='closed',close_json=?",(json.dumps(self.complete_quote('-.15')),))
+        virtual.bootstrap(self.path)
+        a=virtual.accounting(self.path)
+        self.assertEqual(a['confirmed_realized_pnl'],D('-.15'))
+        self.assertEqual(a['closed_complete_ids'],[self.ident])
+        virtual.bootstrap(self.path)
+        self.assertEqual(virtual.accounting(self.path),a)
+        q=self.complete_quote('.7');q.update(net_pnl=None,funding_realized_usdt=None,funding_status='UNKNOWN_SETTLEMENT_PNL')
+        with paper.session(self.path) as db:
+            db.execute('UPDATE virtual_state SET close_json=?',(json.dumps(q),))
+        virtual.bootstrap(self.path)
+        self.assertEqual(virtual.accounting(self.path)['closed_incomplete_ids'],[self.ident])
+        self.assertIsNone(json.loads(self.state()['close_json'])['realized_net_pnl_usdt'])
+
     def test_missing_mandatory_component_blocks_realized(self):
         for key in ('spot_pnl','futures_pnl','funding_realized_usdt','total_trading_fees','net_pnl'):
             q=self.complete_quote('.7');q.pop(key)

@@ -115,6 +115,15 @@ def bootstrap(path=None):
         active = db.execute("SELECT e.* FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short' AND e.first_close_min IS NULL AND v.episode_id IS NULL").fetchall()
         for e in active:
             db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],str(capital(e['actual_spot_usdt'],e['actual_futures_usdt'])),e['executable_spread_pct']))
+        # Upgrade only fully known saved close snapshots; never reconstruct prices/funding.
+        for closed in db.execute("SELECT episode_id,close_json FROM virtual_state WHERE state='closed'").fetchall():
+            try:
+                snapshot=json.loads(closed['close_json'] or '{}')
+                if 'realized_net_pnl_usdt' not in snapshot:
+                    snapshot['realized_net_pnl_usdt']=realized_result(snapshot)
+                    db.execute('UPDATE virtual_state SET close_json=? WHERE episode_id=?',(json.dumps(snapshot),closed['episode_id']))
+            except (ValueError, TypeError):
+                pass
         leverage() # Explicit default/configured startup log.
         for e in db.execute("SELECT e.* FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE v.state='open'").fetchall():
             lev=episode_leverage(db,e['id'])
@@ -129,7 +138,7 @@ def bootstrap(path=None):
         logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), min(deposit()/2, D(250)), recovered)
 
     a=accounting(path)
-    logging.info('Virtual accounting: confirmed_realized_pnl=%s; current_virtual_balance=%s; closed_complete=%s; closed_incomplete=%s; open=%s; used_capital=%s',a['confirmed_realized_pnl'],a['current_virtual_balance'],a['closed_complete'],a['incomplete_closed_pnl_count'],a['open_episodes'],a['used_capital'])
+    logging.info('Virtual accounting: confirmed_realized_pnl=%s; current_virtual_balance=%s; closed_complete=%s; closed_incomplete=%s; open=%s; used_capital=%s; complete_ids=%s; incomplete_ids=%s',a['confirmed_realized_pnl'],a['current_virtual_balance'],a['closed_complete'],a['incomplete_closed_pnl_count'],a['open_episodes'],a['used_capital'],a['closed_complete_ids'],a['closed_incomplete_ids'])
 
 def rows(path=None):
     with paper.session(path) as db:
@@ -253,17 +262,18 @@ def realized_result(q):
 def accounting(path=None, api=None):
     with paper.session(path) as db:
         ensure(db)
-        closed=db.execute("SELECT close_json FROM virtual_state WHERE state='closed'").fetchall()
+        closed=db.execute("SELECT episode_id,close_json FROM virtual_state WHERE state='closed'").fetchall()
         occupied=used(db)
         opened=[dict(r) for r in db.execute("SELECT e.*,v.* FROM episodes e JOIN virtual_state v ON v.episode_id=e.id WHERE v.state='open'").fetchall()]
-    confirmed=D(0); complete=0
+    confirmed=D(0); complete=0; complete_ids=[]; incomplete_ids=[r['episode_id'] for r in closed]
     for row in closed:
         try:
             q=json.loads(row['close_json'] or '{}')
             value=q.get('realized_net_pnl_usdt')
-            if value is None or realized_result(q) is None:
+            if value is None or realized_result(q) is None or number(value)!=number(realized_result(q)):
                 continue
             confirmed+=number(value);complete+=1
+            complete_ids.append(row['episode_id']);incomplete_ids.remove(row['episode_id'])
         except (ValueError, TypeError, ArithmeticError):
             continue
     unrealized=D(0);unknown=0
@@ -281,7 +291,9 @@ def accounting(path=None, api=None):
     return {'confirmed_realized_pnl':confirmed,'cumulative_realized_pnl':confirmed,
             'current_virtual_balance':D(500)+confirmed,'initial_virtual_deposit':D(500),
             'incomplete_closed_pnl_count':len(closed)-complete,'closed_complete':complete,
-            'open_episodes':len(opened),'unrealized_pnl_open':unrealized if unknown==0 else None,
+            'closed_complete_ids':complete_ids,'closed_incomplete_ids':incomplete_ids,
+            'closed_complete_count':complete,'closed_incomplete_count':len(closed)-complete,
+            'open_episodes_count':len(opened),'open_episodes':len(opened),'unrealized_pnl_open':unrealized if unknown==0 else None,
             'known_unrealized_subtotal':unrealized,'unrealized_unknown_count':unknown,
             'used_capital':occupied,'capital_limit':limit,'free_capital':max(D(0),limit-occupied)}
 
@@ -291,11 +303,11 @@ def status(api,chat_id,path=None):
     unrealized=(f"{a['unrealized_pnl_open']:+.2f} USDT" if a['unrealized_pnl_open'] is not None
                 else f"UNKNOWN ({a['unrealized_unknown_count']} incomplete; known subtotal {a['known_unrealized_subtotal']:+.2f} USDT)")
     api.telegram(
-        f"PAPER / VIRTUAL ONLY\nVirtual deposit start: 500.00 USDT\n"
+        f"📊 VIRTUAL ACCOUNT — PAPER ONLY\nInitial deposit: 500.00 USDT\n"
         f"Confirmed realized P&L: {a['confirmed_realized_pnl']:+.2f} USDT\n"
         f"Current virtual balance: {a['current_virtual_balance']:.2f} USDT\n"
         f"Unrealized P&L open: {unrealized}\nOpen episodes: {a['open_episodes']}\n"
-        f"Closed complete: {a['closed_complete']}\nClosed incomplete: {a['incomplete_closed_pnl_count']}\n"
+        f"Closed complete: {a['closed_complete']} {a['closed_complete_ids']}\nClosed incomplete: {a['incomplete_closed_pnl_count']} {a['closed_incomplete_ids']}\n"
         f"Used capital: {a['used_capital']:.2f} / {a['capital_limit']:.2f} USDT\n"
         f"Free capital: {a['free_capital']:.2f} USDT\n"
         "Balance includes confirmed results only; free capital is the unused working limit.",chat_id)
