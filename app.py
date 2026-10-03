@@ -48,6 +48,31 @@ def positive(value):
     return n if n is not None and n >= 0 else None
 
 
+def log_binance_commission_response(response):
+    code=None;message='unrecognized response message redacted'
+    allowed={
+        'Invalid API-key, IP, or permissions for action.',
+        'API-key format invalid.',
+        'Signature for this request is not valid.',
+        'Timestamp for this request is outside of the recvWindow.',
+        "Timestamp for this request was 1000ms ahead of the server's time.",
+        'Mandatory parameter \'symbol\' was not sent, was empty/null, or malformed.',
+        'Invalid symbol.',
+    }
+    try:
+        payload=response.json()
+        if isinstance(payload,dict):
+            value=payload.get('code')
+            if isinstance(value,int) and not isinstance(value,bool):code=value
+            raw=payload.get('msg')
+            if raw in allowed:message=raw
+    except (ValueError,TypeError):
+        message='non-JSON response; body not logged'
+    retry=response.headers.get('Retry-After','')
+    safe_retry=retry if isinstance(retry,str) and retry.isdigit() and len(retry)<=12 else 'absent_or_non_numeric'
+    logging.warning('Binance commission request failed: HTTP status=%s error code=%s message=%s Retry-After=%s',response.status_code,code if code is not None else 'unknown',message,safe_retry)
+
+
 def get_json(url, **kwargs):
     parsed = urlparse(url)
     host_key = parsed.netloc
@@ -90,6 +115,8 @@ def get_json(url, **kwargs):
         logging.log(logging.WARNING if response.status_code>=400 else logging.INFO,
             'Binance futures public GET %s: HTTP=%s exception=%s message=%s API_code=%s Retry-After=%s',
             parsed.path,response.status_code,'HTTPError' if response.status_code>=400 else 'none',label,code if code is not None else '-',safe_retry)
+    if host_key == 'fapi.binance.com' and parsed.path == '/fapi/v1/commissionRate' and response.status_code >= 400:
+        log_binance_commission_response(response)
     if response.status_code in (401, 403, 418, 429):
         retry = response.headers.get('Retry-After', '')
         base_delay = 3600 if response.status_code in (401, 403, 418) else 60

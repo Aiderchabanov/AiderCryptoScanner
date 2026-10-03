@@ -126,6 +126,8 @@ def futures_fee(api, exchange, symbol):
             value = api.dec(row.get('futures_taker_fee')) if isinstance(row, dict) else None                
         if value is None or not 0 <= value < 1:
             raise ValueError('Personal futures fee unavailable')
+        if exchange == 'Binance':
+            logging.info('Binance Futures personal commission OK: HTTP status=200; taker_rate=%s',value)
         return value
     return api.cached(('basis-futures-fee', exchange, symbol), 60, load)
 
