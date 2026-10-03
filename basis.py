@@ -47,6 +47,8 @@ def futures_markets(api):
 
 
 def futures_meta(api, exchange, symbol):
+    if exchange == 'BingX':
+        return api.bingx.futures_meta(symbol)
     if exchange == 'Gate':
         contract = symbol[:-4] + '_USDT'
         info = api.cached(('basis-meta', exchange, symbol), 300,
@@ -97,6 +99,8 @@ def spot_minimum(api, exchange, symbol):
 
 
 def futures_fee(api, exchange, symbol):
+    if exchange == 'BingX':
+        return api.bingx.fee(symbol, futures=True)
     def load():
         if exchange == 'Binance':
             row = api.get_json(FUTURES_BINANCE + '/fapi/v1/commissionRate',
@@ -118,6 +122,8 @@ def futures_fee(api, exchange, symbol):
 
 
 def futures_book(api, exchange, symbol, multiplier):
+    if exchange == 'BingX':
+        return api.bingx.orderbook(symbol, futures=True)
     if exchange == 'Binance':
         row = api.get_json(FUTURES_BINANCE + '/fapi/v1/depth',
                            params={'symbol': symbol, 'limit': 100})
@@ -154,6 +160,8 @@ def funding_expense(rate, direction, notional, crosses):
 
 def fresh_funding(api, exchange, symbol):
     """Fetch the contract's funding independently of cached market metadata."""
+    if exchange == 'BingX':
+        return api.bingx.fresh_funding(symbol)
     if exchange == 'Binance':
         row = api.get_json(FUTURES_BINANCE + '/fapi/v1/premiumIndex', params={'symbol': symbol})
         rate = api.dec(row.get('lastFundingRate'))
@@ -172,6 +180,29 @@ def fresh_funding(api, exchange, symbol):
     return rate, next_at
 
 
+def spread_category(raw, executable):
+    # Both the best prices and executable depth must qualify; no last prices.
+    if raw > 0 and executable > 0:
+        return 'POSITIVE'
+    if Decimal('-2') <= raw < 0 and Decimal('-2') <= executable < 0:
+        return 'NEGATIVE'
+    return None
+
+
+def qualifies(item, now=None):
+    now = time.time() if now is None else now
+    if item['funding'] <= 0 or item['next_funding_at'] <= now:
+        return False
+    category = item.get('category', 'POSITIVE')
+    if 'BingX' in (item.get('spot'), item.get('future')) and item['pct'] < MIN_BASIS_NET:
+        return False
+    if category == 'NEGATIVE':
+        return (Decimal('-2') <= item['raw_spread_pct'] < 0
+                and Decimal('-2') <= item['executable_spread_pct'] < 0
+                and item['next_funding_at'] - now >= 4 * 3600)
+    return category == 'POSITIVE' and item['pct'] >= MIN_BASIS_NET
+
+
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     meta = futures_meta(api, future_exchange, symbol)
     buy_fee = api.fee(spot_exchange, symbol)
@@ -181,7 +212,7 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     if not asks or not bids:
         return None
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
-    if not spot_ask or not perp_bid or spot_ask <= 0 or perp_bid <= spot_ask:
+    if not spot_ask or not perp_bid or spot_ask <= 0 or perp_bid <= 0:
         return None
     quantity = down(min(LEG_USDT * (1 - buy_fee) / spot_ask,
                         LEG_USDT / perp_bid), meta['step'])
@@ -197,8 +228,15 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
         return None
     if cost < LEG_USDT * Decimal('0.8') or short_proceeds < LEG_USDT * Decimal('0.8'):
         return None
+    raw_spread = (perp_bid / spot_ask - 1) * 100
+    executable_spread = ((short_proceeds / quantity) / (cost / acquired) - 1) * 100
+    category = spread_category(raw_spread, executable_spread)
+    if category is None:
+        return None
     funding, next_funding = fresh_funding(api, future_exchange, symbol)
     now = time.time()
+    if category == 'NEGATIVE' and (funding <= 0 or next_funding - now < 4 * 3600):
+        return None
     crosses_funding = next_funding <= now + 60 * 60
     # Short pays negative funding; a possible positive receipt is not booked.
     funding_debit = funding_expense(funding, 'short', short_proceeds, crosses_funding)
@@ -211,6 +249,8 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     projected = spot_exit + short_proceeds - cover - cost - open_fee - close_fee - funding_debit - price_buffer
     pct = projected / cost * 100
     return {'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
+            'category': category, 'raw_spread_pct': raw_spread,
+            'executable_spread_pct': executable_spread,
             'quantity': quantity, 'spot_entry': cost / acquired,
             'future_entry': short_proceeds / quantity, 'spot_cost': cost,
             'future_notional': short_proceeds, 'spot_exit': price * (1 - EXIT_SLIPPAGE),
@@ -223,29 +263,38 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
             'spot_slippage_usdt': max(Decimal(0), cost - acquired * spot_ask),
             'futures_slippage_usdt': max(Decimal(0), quantity * perp_bid - short_proceeds),
             'multiplier': meta['multiplier'],
+            'paper_budget_usdt': LEG_USDT,
             'reserve': RESERVE_USDT}
 
 
 def scan(api):
     if not paper.storage_ready():
         return []  # Never alert without durable episode/checkpoint records.
-    if not all((api.BINANCE_KEY, api.BINANCE_SECRET, api.GATE_KEY, api.GATE_SECRET)):
-        return []
-    spots = api.tickers()
-    futures = futures_markets(api)
+    if getattr(api, 'multi_exchange', False) is True:
+        spots, futures = api.market_maps()
+        directions = [(spot, future, spot_rows, perp_rows)
+                      for spot, spot_rows in spots.items()
+                      for future, perp_rows in futures.items()
+                      if spot != future and api.credentials_ready(spot) and api.credentials_ready(future)]
+    else:
+        if not all((api.BINANCE_KEY, api.BINANCE_SECRET, api.GATE_KEY, api.GATE_SECRET)):
+            return []
+        spots = api.tickers()
+        futures = futures_markets(api)
+        directions = [('Binance', 'Gate', spots[0], futures[1]),
+                      ('Gate', 'Binance', spots[1], futures[0])]
     shortlist = []
-    for spot_name, future_name, spot_rows, perp_rows in (
-        ('Binance', 'Gate', spots[0], futures[1]),
-        ('Gate', 'Binance', spots[1], futures[0]),
-    ):
+    for spot_name, future_name, spot_rows, perp_rows in directions:
         for symbol in spot_rows.keys() & perp_rows.keys():
-            spot_price = api.dec(spot_rows[symbol].get('askPrice' if spot_name == 'Binance' else 'lowest_ask'))
-            perp_price = api.dec(perp_rows[symbol].get('bidPrice' if future_name == 'Binance' else 'highest_bid'))
-            if spot_price and perp_price and spot_price > 0 and perp_price > spot_price:
+            spot_price = api.dec(spot_rows[symbol].get('lowest_ask' if spot_name == 'Gate' else 'askPrice'))
+            perp_price = api.dec(perp_rows[symbol].get('highest_bid' if future_name == 'Gate' else 'bidPrice'))
+            if spot_price and perp_price and spot_price > 0 and perp_price > 0 and (perp_price > spot_price or Decimal('-2') <= (perp_price / spot_price - 1) * 100 < 0):
                 shortlist.append(((perp_price / spot_price - 1), symbol, spot_name, future_name,
                                   perp_rows[symbol].get('funding_rate')))
-    shortlist = sorted((item for direction in (('Binance', 'Gate'), ('Gate', 'Binance'))
-                        for item in sorted((x for x in shortlist if x[2:4] == direction),
+    shortlist = sorted((item for direction in ((x[0], x[1]) for x in directions)
+                        for negative in (False, True)
+                        for item in sorted((x for x in shortlist if x[2:4] == direction
+                                            and (x[0] < 0) == negative),
                                            reverse=True)[:MAX_BASIS_CANDIDATES]), reverse=True)
     found = []
     for _, symbol, spot, future, funding in shortlist:
@@ -253,7 +302,7 @@ def scan(api):
             continue
         try:
             item = evaluate(api, symbol, spot, future, funding)
-            if item and item['pct'] >= MIN_BASIS_NET and not item['funding_filtered']:
+            if item and qualifies(item):
                 found.append(item)
             elif item and item['funding_filtered']:
                 logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING: nonpositive rate',
@@ -270,7 +319,9 @@ def scan(api):
                             (getattr(response, 'url', '') or '').split('?')[0])
     found.sort(key=lambda x: x['pct'], reverse=True)
     now = time.time()
-    for item in found[:3]:
+    alerts = [item for category in ('POSITIVE', 'NEGATIVE')
+              for item in [x for x in found if x.get('category', 'POSITIVE') == category][:3]]
+    for item in alerts:
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
             # Recheck directly before creating an episode or sending Telegram.
@@ -280,12 +331,14 @@ def scan(api):
                              item['symbol'], item['spot'], item['future'])
                 continue
             item['funding'], item['next_funding_at'] = rate, next_at
+            if not qualifies(item):
+                continue
             item['funding_crosses_60m'] = next_at <= time.time() + 3600
             item['funding_debit'] = Decimal(0)  # Positive short funding is never booked as certain income.
             episode_id = paper.record(item)
             if episode_id is None:
                 continue  # Same continuous spread episode.
-            api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol']))
+            api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol'], item.get('category', 'POSITIVE')))
             last_alert[key] = now
         except Exception as exc:
             logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
@@ -294,25 +347,29 @@ def scan(api):
 
 
 def format_alert(x):
-    return (f"📊 Спот + бессрочный фьючерс: {x['symbol']}\n"
-            f"Условный результат при схождении цен: {x['pct']:.2f}% "
-            f"(≈ {x['projected']:.2f} USDT на {x['spot_cost']:.2f} USDT спота).\n"
-            f"Купить спот {x['spot']}: {x['quantity']:.8g} по ≈ {x['spot_entry']:.8g} USDT.\n"
-            f"Открыть шорт {x['future']}: тот же объём по ≈ {x['future_entry']:.8g} USDT.\n"
+    category = x.get('category', 'POSITIVE')
+    title = '🟢 SPOT → FUTURES POSITIVE' if category == 'POSITIVE' else '📉 SPOT → FUTURES NEGATIVE'
+    remaining = max(0, int(x['next_funding_at'] - time.time()))
+    raw = x.get('raw_spread_pct', (x.get('future_bid', x['future_entry']) / x.get('spot_ask', x['spot_entry']) - 1) * 100)
+    executable = x.get('executable_spread_pct', (x['future_entry'] / x['spot_entry'] - 1) * 100)
+    return (f"{title}\nМонета: {x['symbol']}\n"
+            f"Spot: {x['spot']}; Futures: {x['future']}\n"
+            f"Размер: ${LEG_USDT:.0f}; резерв: ${RESERVE_USDT:.0f} на каждой бирже.\n"
+            f"Spot Ask: {x.get('spot_ask', x['spot_entry']):.8g}; Futures Bid: {x.get('future_bid', x['future_entry']):.8g} USDT.\n"
+            f"Исполнимые цены по стакану: Spot {x['spot_entry']:.8g}; Futures {x['future_entry']:.8g}.\n"
+            f"Фактические объёмы: {x['spot_cost']:.2f} USDT спот; "
+            f"{x.get('future_notional', x['quantity'] * x['future_entry']):.2f} USDT фьючерс.\n"
+            f"Начальный spread: {raw:+.4f}%; по стакану: {executable:+.4f}%.\n"
             f"Funding: +{x['funding']*100:.4f}%\n"
-            f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(x['next_funding_at']))}\n"
+            f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(x['next_funding_at']))}\n"
+            f"До funding: {remaining // 3600} ч {(remaining % 3600) // 60} мин {remaining % 60} сек.\n"
             "Статус: положительный — условие выполнено.\n"
-            f"Модель выхода при схождении около {x['spot_entry']:.8g}: "
-            f"спот ≈ {x['spot_exit']:.8g}, покрытие шорта ≈ {x['future_exit']:.8g}.\n"
-            f"Комиссии спот/фьючерс за сторону: {x['spot_fee']*100:.3f}% / "
-            f"{x['future_fee']*100:.3f}%; учтены 4 сделки, проскальзывание "
-            f"{EXIT_SLIPPAGE*100:.2f}% на каждой стороне выхода и возможная плата "
-            f"funding ≈ {x['funding_debit']:.3f} USDT (short, ставка {x['funding']*100:.4f}%, "
-            f"следующий расчёт {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(x['next_funding_at']))}; "
-            "выплата лишь если позиция останется открыта к этому времени); дополнительный защитный резерв "
-            f"{PRICE_BUFFER_PCT:.2f}% (≈ {x['price_buffer']:.2f} USDT).\n"
-            f"Разместить примерно по {LEG_USDT:.0f} USDT на споте и в залоге фьючерса "
-            f"плюс по {x['reserve']:.0f} USDT резерва на каждой бирже. "
-            "Баланс, маржа и риск ликвидации не проверены. "
-            "При расширении разницы или изменении funding возможен убыток. "
-            "Это уведомление, без автоматических сделок.")
+            f"Комиссии spot/futures за сторону: {x['spot_fee']*100:.3f}% / {x['future_fee']*100:.3f}%. "
+            f"Учтены четыре сделки; проскальзывание входа включено в цены; "
+            f"резерв проскальзывания выхода {EXIT_SLIPPAGE*100:.2f}% на каждой стороне; "
+            f"защитный резерв {PRICE_BUFFER_PCT:.2f}% ({x['price_buffer']:.3f} USDT); "
+            f"расход funding {x['funding_debit']:.3f} USDT.\n"
+            f"Модель результата при схождении после расходов: {x['pct']:+.2f}% "
+            f"({x['projected']:+.3f} USDT). Это оценка, не реализованная прибыль; "
+            "доход от будущего funding не включён.\n"
+            "PAPER / VIRTUAL ONLY. Реальные ордера, переводы, выводы и усреднение не выполняются.")

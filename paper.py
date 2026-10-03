@@ -6,6 +6,7 @@ remain available for isolated tests. No exchange order or transfer API is used.
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import statistics
@@ -173,8 +174,16 @@ def record(item, path=None, at=None):
         next_at = float(item['next_funding_at'])
     except (KeyError, InvalidOperation, ValueError, TypeError):
         return None
-    if not rate.is_finite() or rate <= 0 or next_at <= now:
+    if not rate.is_finite() or rate <= 0 or not math.isfinite(next_at) or next_at <= now:
         return None  # Defense in depth; basis.scan also rechecks live funding.
+    raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
+    executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
+    if raw < 0 or executable < 0:
+        if not (Decimal('-2') <= raw < 0 and Decimal('-2') <= executable < 0
+                and next_at - now >= 4 * 3600):
+            return None
+    elif raw == 0 or executable == 0:
+        return None
     with session(path) as db:
         if getattr(db, 'is_postgres', False):
             # Serialize episode creation for this pair, including the first row.
@@ -189,6 +198,24 @@ def record(item, path=None, at=None):
                       (prior['first_close_min'] is None and
                        now < prior['started_at'] + EPISODE_COOLDOWN_SECONDS)):
             return None
+        budget = item.get('paper_budget_usdt')
+        if budget is not None:
+            budget = Decimal(str(budget))
+            if not budget.is_finite() or budget <= 0 or budget > Decimal('50'):
+                return None
+            # Lock exchange budgets in a stable order across concurrent scans.
+            if getattr(db, 'is_postgres', False):
+                for exchange in sorted({item['spot'], item['future']}):
+                    db.execute('SELECT pg_advisory_xact_lock(hashtext(?))',
+                               ('paper-budget:' + exchange,))
+            active = db.execute("SELECT * FROM episodes WHERE direction='spot_buy/futures_short' AND first_close_min IS NULL").fetchall()
+            for exchange, addition in ((item['spot'], item['spot_cost']),
+                                       (item['future'], item['future_notional'])):
+                used = sum((Decimal(r['actual_spot_usdt']) if r['spot_exchange'] == exchange else Decimal(0))
+                           + (Decimal(r['actual_futures_usdt']) if r['futures_exchange'] == exchange else Decimal(0))
+                           for r in active)
+                if used + addition > budget:
+                    return None  # Keep at least $50 of the virtual $100 untouched.
         raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
         executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
         # Explicit allowlist: never persist API credentials or future private fields.
@@ -197,7 +224,7 @@ def record(item, path=None, at=None):
                         'future_entry', 'pct', 'funding', 'next_funding_at',
                         'funding_debit', 'spot_fee', 'future_fee',
                         'spot_slippage_usdt', 'futures_slippage_usdt',
-                        'price_buffer', 'multiplier')
+                        'price_buffer', 'multiplier', 'paper_budget_usdt')
         snapshot = {key: str(item[key]) for key in saved_fields if key in item}
         row = (item['symbol'], item['spot'], item['future'], 'spot_buy/futures_short',
                now, '50', str(item['spot_cost']), str(item['future_notional']),
@@ -269,7 +296,7 @@ def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
         db.execute('''UPDATE episodes SET min_spread_pct=? WHERE id=?
                       AND CAST(min_spread_pct AS REAL)>?''',
                    (str(spread), episode['id'], float(spread)))
-        if spread <= CLOSED_PCT:
+        if (first < 0 and spread >= 0) or (first > 0 and spread <= CLOSED_PCT):
             db.execute('''UPDATE episodes SET first_close_min=COALESCE(first_close_min,?),
                           status='closed' WHERE id=?''', (minute, episode['id']))
     if minute == 60:
@@ -307,11 +334,15 @@ def poll(api, path=None, at=None):
             finish_checkpoint(db, episode, minute, now, sample=sample)
 
 
-def statistics_for(db, symbol=None):
-    query = 'SELECT e.id, e.first_close_min, e.status FROM episodes e'
+def statistics_for(db, symbol=None, category=None):
+    query = "SELECT e.* FROM episodes e WHERE e.direction='spot_buy/futures_short'"
     params = ()
+    if category == 'POSITIVE':
+        query += ' AND CAST(e.executable_spread_pct AS REAL)>0'
+    elif category == 'NEGATIVE':
+        query += ' AND CAST(e.executable_spread_pct AS REAL)<0'
     if symbol:
-        query += ' WHERE e.symbol=?'
+        query += ' AND e.symbol=?'
         params = (symbol,)
     rows = db.execute(query, params).fetchall()
     complete = []
@@ -330,9 +361,14 @@ def statistics_for(db, symbol=None):
             'not_closed_60m_pct': round(100 * (n - len(times)) / n, 1) if n else None}
 
 
-def history_line(path, symbol):
+def history_line(path, symbol, category='POSITIVE'):
     with session(path) as db:
-        data = statistics_for(db, symbol)
+        if category == 'NEGATIVE':
+            negative = negative_statistics(db, symbol)
+            return (f"История NEGATIVE {symbol[:-4]}: {negative['count']} эпизодов; "
+                    f"наблюдалось ≥0%: {negative['reached_zero']}; "
+                    f"положительный spread: {negative['became_positive']}.")
+        data = statistics_for(db, symbol, 'POSITIVE')
     n = data['complete']
     if n < MIN_HISTORY:
         return f"История {symbol[:-4]}: {n} полных наблюдений; недостаточно истории."
@@ -341,18 +377,44 @@ def history_line(path, symbol):
             f"медиана первого наблюдения закрытия {data['median_close_min']} мин.")
 
 
+def negative_statistics(db, symbol=None):
+    query = "SELECT * FROM episodes WHERE direction='spot_buy/futures_short' AND CAST(executable_spread_pct AS REAL)<0"
+    params = ()
+    if symbol:
+        query += ' AND symbol=?'
+        params = (symbol,)
+    rows = db.execute(query, params).fetchall()
+    reached, positive, times = 0, 0, []
+    entries = [Decimal(r['executable_spread_pct']) for r in rows]
+    for row in rows:
+        samples = db.execute("SELECT * FROM checkpoints WHERE episode_id=? AND status='observed' ORDER BY sampled_at", (row['id'],)).fetchall()
+        nonnegative = [c for c in samples if Decimal(c['executable_spread_pct']) >= 0]
+        if nonnegative:
+            reached += 1
+            times.append((nonnegative[0]['sampled_at'] - row['started_at']) / 60)
+        if any(Decimal(c['executable_spread_pct']) > 0 for c in samples):
+            positive += 1
+    return {'count': len(rows), 'mean_entry': sum(entries) / len(entries) if entries else None,
+            'worst_entry': min(entries) if entries else None,
+            'reached_zero': reached, 'became_positive': positive,
+            'mean_zero_min': statistics.mean(times) if len(times) >= MIN_HISTORY else None,
+            'zero_samples': len(times)}
+
+
 def stats_line(path=None, symbol=None):
     with session(path) as db:
-        data = statistics_for(db, symbol)
-    label = symbol[:-4] if symbol else 'весь сканер'
-    rates = data['closed_by_pct']
-    pct = lambda value: 'нет данных' if value is None else f'{value}%'
-    return (f"История {label}: {data['observations']} эпизодов, "
-            f"{data['complete']} полных наблюдений; "
-            f"неполных {data['incomplete']}.\n"
-            + ('Недостаточно истории.\n' if data['complete'] < MIN_HISTORY else '')
-            + 'Закрылись ≤0,10% к 1/5/15/30/60 мин: '
-            + ' / '.join(pct(rates[str(t)]) for t in HORIZONS) + '.\n'
-            + f"Медиана первого наблюдения закрытия: {data['median_close_min']} мин; "
-            + f"среднее: {data['mean_close_min']} мин. "
-            + f"Не закрылись за 60 мин: {pct(data['not_closed_60m_pct'])}.")
+        positive = statistics_for(db, symbol, 'POSITIVE')
+        negative = negative_statistics(db, symbol)
+    value = lambda x: 'нет данных' if x is None else f'{x:.2f}'
+    rates = positive['closed_by_pct']
+    return (f"SPOT → FUTURES — PAPER / VIRTUAL: {symbol or 'Binance / Gate / BingX'}\n"
+            f"POSITIVE: {positive['observations']} эпизодов; полных: {positive['complete']}; неполных: {positive['incomplete']}.\n"
+            "Спред ≤0,10% к 1/5/15/30/60 мин: "
+            + ' / '.join('нет данных' if rates[str(t)] is None else f"{rates[str(t)]}%" for t in HORIZONS)
+            + f". Среднее время: {value(positive['mean_close_min'])} мин.\n"
+            + f"NEGATIVE: {negative['count']} эпизодов.\n"
+            + f"Средний spread входа по стакану: {value(negative['mean_entry'])}%; самый отрицательный: {value(negative['worst_entry'])}%.\n"
+            + f"Дошли до 0% или выше: {negative['reached_zero']}; перешли в положительный: {negative['became_positive']}.\n"
+            + f"Среднее время первого наблюдения ≥0%: {value(negative['mean_zero_min'])} мин "
+            + f"(наблюдений: {negative['zero_samples']}; минимум для среднего: {MIN_HISTORY}).\n"
+            + "Только фактические контрольные точки; пропущенные замеры не восстанавливаются. Достижение порога спреда не означает реализованную прибыль.")

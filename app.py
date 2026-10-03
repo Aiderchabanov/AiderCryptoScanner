@@ -11,6 +11,7 @@ import requests
 from flask import Flask
 import basis
 import paper
+import exchanges
 
 BINANCE = 'https://api.binance.com'
 GATE = 'https://api.gateio.ws/api/v4'
@@ -454,7 +455,12 @@ def estimate(symbol, buy, sell, top_ask, top_bid):
     return best
 
 
+SPOT_SPOT_ENABLED = False  # Preserve legacy implementation; explicitly disabled.
+
+
 def scan_once():
+    if not SPOT_SPOT_ENABLED:
+        return []
     if not all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)):
         return []
     bd, gd = tickers()
@@ -517,10 +523,28 @@ def loop():
         time.sleep(SCAN)
 
 
+scanner_api = None
+scanner_api_lock = threading.Lock()
+
+
+def current_scanner_api():
+    global scanner_api
+    with scanner_api_lock:
+        if scanner_api is None:
+            scanner_api = exchanges.ScannerAPI(__import__(__name__))
+    return scanner_api
+
+
 def basis_loop():
+    if current_scanner_api().bingx.enabled:
+        # One read-only probe shares the scanner's limiter; never records or alerts.
+        import smoke_bingx
+        report = smoke_bingx.probe(current_scanner_api().bingx)
+        logging.info('BingX GET-only startup probe: %s',
+                     {k: v.get('ok') for k, v in report.items() if isinstance(v, dict)})
     while True:
         try:
-            results = basis.scan(__import__(__name__))
+            results = basis.scan(current_scanner_api())
             logging.info('basis scan: %s conditional alerts', len(results))
         except Exception:
             logging.exception('basis scan failed')
@@ -531,7 +555,7 @@ def paper_loop():
     while True:
         try:
             if paper.storage_ready():
-                paper.poll(__import__(__name__))
+                paper.poll(current_scanner_api())
         except Exception:
             logging.exception('Virtual checkpoints unavailable; no historical price substituted')
         time.sleep(min(SCAN, 20))
@@ -542,10 +566,12 @@ def paper_loop():
 
 @app.get('/')
 def home():
-    return {'status': 'ok', 'scanner': 'Binance-Gate', 'min_net_profit_pct': float(THRESH),
+    return {'status': 'ok', 'scanner': 'Spot→Futures Binance-Gate-BingX', 'spot_spot_enabled': SPOT_SPOT_ENABLED, 'min_net_profit_pct': float(THRESH),
             'trade_usdt': float(TRADE), 'reserve_usdt_per_exchange': float(RESERVE),
             'price_buffer_pct': float(PRICE_BUFFER_PCT),
             'cost_data_ready': all((BINANCE_KEY, BINANCE_SECRET, GATE_KEY, GATE_SECRET)),
+            'bingx_enabled': current_scanner_api().bingx.enabled,
+            'bingx_credentials_ready': current_scanner_api().bingx.credentials_ready,
             'basis_mode': 'read-only', 'basis_leg_usdt': float(basis.LEG_USDT),
             'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT),
             'paper_storage_ready': paper.storage_ready()}
@@ -569,7 +595,7 @@ def telegram_updates():
                 chat_id = message.get('chat', {}).get('id')
                 command = message.get('text', '').split(maxsplit=1)
                 if command and command[0].split('@')[0] == '/start' and chat_id:
-                    telegram(f'✅ Aider Crypto Scanner запущен. Проверка чистой прибыли ≥ {THRESH}% по Binance ↔ Gate.', chat_id)
+                    telegram('✅ Spot → Futures Binance / Gate / BingX. POSITIVE / NEGATIVE. PAPER / VIRTUAL ONLY. Spot → Spot отключён.', chat_id)
                     logging.info('Telegram /start answered')
                 if command and command[0].split('@')[0] == '/stats' and chat_id and str(chat_id) == str(CHAT_ID):
                     try:
@@ -606,7 +632,8 @@ def log_webhook_owner():
 if __name__ == '__main__':
     if not paper.storage_ready():
         logging.warning('Virtual episode storage unavailable: Spot/Futures alerts paused')
-    threading.Thread(target=loop, daemon=True).start()
+    if SPOT_SPOT_ENABLED:
+        threading.Thread(target=loop, daemon=True).start()
     threading.Thread(target=basis_loop, daemon=True).start()
     threading.Thread(target=paper_loop, daemon=True).start()
     if log_webhook_owner():
