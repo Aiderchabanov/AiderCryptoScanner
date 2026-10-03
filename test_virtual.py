@@ -131,6 +131,57 @@ class VirtualTests(unittest.TestCase):
         self.assertIsNotNone(paper.record(dict(self.item,symbol='SIXTHUSDT'),self.path))
         self.assertIsNone(paper.record(self.item,self.path,parent_id=virtual.rows(self.path)[0]['episode_id']))
 
+    def test_checkpoint_full_exit_snapshot_no_telegram_or_capital_change(self):
+        e=virtual.load(self.ident,self.path)
+        with patch('time.time',return_value=e['started_at']+60):
+            paper.poll(self.api,self.path,at=e['started_at']+60)
+        with paper.session(self.path) as db:
+            c=db.execute('SELECT * FROM virtual_checkpoint_details').fetchone()
+            q=json.loads(c['snapshot_json'])
+            self.assertEqual(c['horizon_min'],1)
+            self.assertEqual(q['spot_bid'],'10')
+            self.assertEqual(q['futures_ask'],'10.11')
+            self.assertEqual(D(q['spot_exit']),D('10'))
+            self.assertEqual(D(q['future_exit']),D('10.11'))
+            self.assertEqual(D(q['spot_pnl'])+D(q['futures_pnl']),D(q['net_pnl']))
+            self.assertIn('slippage',q);self.assertIn('total_trading_fees',q)
+            self.assertEqual(q['funding_rate_current'],'0.0001')
+            self.assertEqual(D(q['spread_change_pp']),D(q['spread'])-D('1.8'))
+            self.assertEqual(virtual.used(db),D(50))
+        self.api.telegram.assert_not_called()
+        self.assertEqual(self.state()['state'],'open')
+
+    def test_missed_checkpoint_not_backfilled_and_unknown_funding_not_zero(self):
+        e=virtual.load(self.ident,self.path)
+        paper.poll(self.api,self.path,at=e['started_at']+121)
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute('SELECT status FROM checkpoints WHERE horizon_min=1').fetchone()[0],'missing')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_checkpoint_details').fetchone()[0],0)
+        self.funding.side_effect=ValueError('missing funding')
+        q=paper.lifecycle_sample(self.api,e)['pnl_snapshot']
+        self.assertIsNone(q['funding_rate_current'])
+
+    def test_statistics_mature_cohorts_actual_convergence_and_missing_history(self):
+        e=virtual.load(self.ident,self.path);start=e['started_at']
+        second=paper.record(dict(self.item,symbol='OTHERUSDT'),self.path)
+        with paper.session(self.path) as db:
+            db.execute('UPDATE virtual_metrics SET convergence_seconds=90 WHERE episode_id=?',(self.ident,))
+            db.execute("UPDATE virtual_state SET state='closed' WHERE episode_id=?",(self.ident,))
+            for minute in paper.HORIZONS+paper.EXTENDED_HORIZONS:
+                db.execute('INSERT INTO virtual_checkpoint_details VALUES (?,?,?,?)',(second,minute,start+minute*60,'{}'))
+            early=paper.lifecycle_statistics(db,at=start+30)
+            self.assertIsNone(early['closed_by_pct']['1'])
+            stats=paper.lifecycle_statistics(db,at=start+86401)
+            self.assertEqual(stats['closed_by_pct']['1'],0)
+            self.assertEqual(stats['closed_by_pct']['5'],50)
+            self.assertEqual(stats['closed_by_pct']['1440'],50)
+            self.assertEqual(stats['not_closed_24h_pct'],50)
+            self.assertEqual(stats['median_close_min'],1.5)
+            db.execute('DELETE FROM virtual_checkpoint_details WHERE episode_id=? AND horizon_min=1',(second,))
+            self.assertEqual(paper.lifecycle_statistics(db,at=start+86401)['eligible_by_horizon']['1440'],1)
+            db.execute('UPDATE virtual_metrics SET tracking_started_at=?',(start+1000,))
+            self.assertEqual(paper.lifecycle_statistics(db,at=start+86401)['tracked'],0)
+
     def test_unknown_negative_funding_and_anomaly_repeat(self):
         e=virtual.load(self.ident,self.path)
         with patch.object(basis,'evaluate',return_value=dict(self.item,pct=D(1),category='POSITIVE')),patch.object(basis,'fresh_funding',return_value=(D('-0.001'),time.time()+3600)):

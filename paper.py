@@ -288,6 +288,29 @@ def executable_sample(api, episode):
             'executable_spread_pct': (future_vwap / spot_vwap - 1) * 100}
 
 
+def lifecycle_sample(api, episode):
+    """One fresh pair of books supplies spread and executable closing P&L."""
+    import virtual
+    q=virtual.quote(api,dict(episode))
+    q['spread_change_pp']=str(Decimal(q['spread'])-Decimal(episode['executable_spread_pct']))
+    q['spread_reduction_pp']=str(-Decimal(q['spread_change_pp']))
+    # A funding quote is not proof of an accrued settlement payment.
+    q['funding_rate_current']=None; q['next_funding_at_current']=None
+    try:
+        rate,next_at=api.basis.fresh_funding(api,episode['futures_exchange'],episode['symbol'])
+        rate=virtual.number(rate)
+        if next_at is not None and float(next_at)>time.time():
+            q['funding_rate_current']=str(rate);q['next_funding_at_current']=float(next_at)
+    except Exception:
+        pass
+    if time.time()-q['at']>30:
+        raise ValueError('Checkpoint quotes became stale during funding request')
+    return {'spot_ask':Decimal(q['spot_ask']),'spot_vwap':Decimal(q['spot_entry_vwap_now']),
+            'futures_bid':Decimal(q['futures_bid']),'futures_vwap':Decimal(q['future_entry_vwap_now']),
+            'raw_spread_pct':Decimal(q['raw_spread']),'executable_spread_pct':Decimal(q['spread']),
+            'pnl_snapshot':q}
+
+
 def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
     first = Decimal(episode['executable_spread_pct'])
     if sample is None:
@@ -295,6 +318,11 @@ def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
                       WHERE episode_id=? AND horizon_min=? AND status='pending' ''',
                    (now, reason or 'нет данных', episode['id'], minute))
     else:
+        if sample.get('pnl_snapshot') is not None:
+            db.execute('''INSERT INTO virtual_checkpoint_details
+                (episode_id,horizon_min,sampled_at,snapshot_json) VALUES (?,?,?,?)
+                ON CONFLICT (episode_id,horizon_min) DO NOTHING''',
+                (episode['id'],minute,now,json.dumps(sample['pnl_snapshot'])))
         spread = sample['executable_spread_pct']
         reduction = first - spread
         relative = reduction / first * 100 if first > 0 else None
@@ -348,12 +376,23 @@ def poll(api, path=None, at=None):
                 finish_checkpoint(db, episode, minute, now, reason='нет данных: окно замера пропущено')
                 continue
             try:
-                sample = executable_sample(api, episode)
+                managed = db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(episode['id'],)).fetchone()
+                sample = lifecycle_sample(api, episode) if managed else executable_sample(api, episode)
+                if managed:
+                    sample['pnl_snapshot']['episode_state']=managed['state']
+                    sample['pnl_snapshot']['valuation_kind']='open_position' if managed['state']=='open' else 'hypothetical_after_close'
+                actual_now = time.time() if at is None else now
+                if actual_now > episode['due_at'] + WINDOW_SECONDS:
+                    finish_checkpoint(db,episode,minute,actual_now,reason='нет данных: свежий ответ вне окна замера')
+                    continue
+                now_sample = actual_now
             except Exception as exc:
                 logging.warning('Virtual checkpoint %s +%sm unavailable: %s',
                                 episode['symbol'], minute, type(exc).__name__)
                 continue  # Retry until the sampling window expires.
-            finish_checkpoint(db, episode, minute, now, sample=sample)
+            finish_checkpoint(db, episode, minute, now_sample, sample=sample)
+            if managed:
+                logging.info('Virtual checkpoint stored: episode #%s +%sm; fresh executable exit/P&L snapshot',episode['id'],minute)
 
 
 def statistics_for(db, symbol=None, category=None):
@@ -381,6 +420,44 @@ def statistics_for(db, symbol=None, category=None):
             'median_close_min': statistics.median(times) if times else None,
             'mean_close_min': round(statistics.mean(times), 2) if times else None,
             'not_closed_60m_pct': round(100 * (n - len(times)) / n, 1) if n else None}
+
+
+def lifecycle_statistics(db, symbol=None, category=None, at=None):
+    """Cohorts use actual convergence, never manual close or fabricated history."""
+    import virtual
+    virtual.ensure(db)
+    now=time.time() if at is None else at
+    query="""SELECT e.*,v.state,m.tracking_started_at,m.convergence_seconds
+        FROM episodes e JOIN virtual_state v ON v.episode_id=e.id
+        JOIN virtual_metrics m ON m.episode_id=e.id
+        WHERE e.direction='spot_buy/futures_short' """
+    args=[]
+    if symbol:query+=' AND e.symbol=?';args.append(symbol)
+    if category=='POSITIVE':query+=' AND CAST(e.executable_spread_pct AS REAL)>0'
+    if category=='NEGATIVE':query+=' AND CAST(e.executable_spread_pct AS REAL)<0'
+    rows=db.execute(query,args).fetchall()
+    # Legacy adoption cannot supply unseen entry-to-adoption observations.
+    rows=[r for r in rows if r['tracking_started_at']<=r['started_at']+30]
+    horizons=HORIZONS+EXTENDED_HORIZONS
+    rates={};denominators={}
+    for minute in horizons:
+        eligible=[]
+        for r in rows:
+            elapsed=now-r['started_at'];convergence=r['convergence_seconds']
+            if elapsed<minute*60:
+                continue
+            if convergence is not None and convergence<=minute*60:
+                eligible.append(True)
+            elif elapsed>=minute*60 and (r['state']=='open' or convergence is not None):
+                count=first_value(db.execute("SELECT COUNT(*) FROM virtual_checkpoint_details WHERE episode_id=? AND horizon_min<=?",(r['id'],minute)).fetchone())
+                if count==sum(t<=minute for t in horizons):eligible.append(False)
+        denominators[str(minute)]=len(eligible)
+        rates[str(minute)]=round(100*sum(eligible)/len(eligible),1) if eligible else None
+    times=[r['convergence_seconds']/60 for r in rows if r['convergence_seconds'] is not None]
+    return {'tracked':len(rows),'closed_by_pct':rates,'eligible_by_horizon':denominators,
+        'mean_close_min':round(statistics.mean(times),2) if times else None,
+        'median_close_min':statistics.median(times) if times else None,
+        'not_closed_24h_pct':100-rates['1440'] if rates['1440'] is not None else None}
 
 
 def history_line(path, symbol, category='POSITIVE'):
@@ -427,16 +504,17 @@ def stats_line(path=None, symbol=None):
     with session(path) as db:
         positive = statistics_for(db, symbol, 'POSITIVE')
         negative = negative_statistics(db, symbol)
+        lifecycle = {c:lifecycle_statistics(db,symbol,c) for c in ('POSITIVE','NEGATIVE')}
     value = lambda x: 'нет данных' if x is None else f'{x:.2f}'
     rates = positive['closed_by_pct']
     return (f"SPOT → FUTURES — PAPER / VIRTUAL: {symbol or 'Binance / Gate / BingX'}\n"
             f"POSITIVE: {positive['observations']} эпизодов; полных: {positive['complete']}; неполных: {positive['incomplete']}.\n"
-            "Спред ≤0,10% к 1/5/15/30/60 мин: "
-            + ' / '.join('нет данных' if rates[str(t)] is None else f"{rates[str(t)]}%" for t in HORIZONS)
-            + f". Среднее время: {value(positive['mean_close_min'])} мин.\n"
-            + f"NEGATIVE: {negative['count']} эпизодов.\n"
+            f"NEGATIVE: {negative['count']} эпизодов.\n"
             + f"Средний spread входа по стакану: {value(negative['mean_entry'])}%; самый отрицательный: {value(negative['worst_entry'])}%.\n"
             + f"Дошли до 0% или выше: {negative['reached_zero']}; перешли в положительный: {negative['became_positive']}.\n"
             + f"Среднее время первого наблюдения ≥0%: {value(negative['mean_zero_min'])} мин "
             + f"(наблюдений: {negative['zero_samples']}; минимум для среднего: {MIN_HISTORY}).\n"
-            + "Только фактические контрольные точки; пропущенные замеры не восстанавливаются. Достижение порога спреда не означает реализованную прибыль.")
+            + '\n'.join(f"{c} — схождение к 1/5/15/30/60 мин, 3/6/12/24 ч: "
+                + ' / '.join('нет данных' if d['closed_by_pct'][str(t)] is None else f"{d['closed_by_pct'][str(t)]}% (n={d['eligible_by_horizon'][str(t)]})" for t in HORIZONS+EXTENDED_HORIZONS)
+                + f"; среднее {value(d['mean_close_min'])} мин; медиана {value(d['median_close_min'])} мин; не сошлись за 24 ч {value(d['not_closed_24h_pct'])}%." for c,d in lifecycle.items())
+            + "\nТолько фактические контрольные точки; пропущенные замеры не восстанавливаются. Достижение порога спреда не означает реализованную прибыль.")

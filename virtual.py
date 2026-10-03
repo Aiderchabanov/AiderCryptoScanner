@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS virtual_events (
  event_key TEXT PRIMARY KEY, episode_id BIGINT NOT NULL, body TEXT NOT NULL,
  buttons_json TEXT, state TEXT NOT NULL DEFAULT 'pending'
 );
+CREATE TABLE IF NOT EXISTS virtual_checkpoint_details (
+ episode_id BIGINT NOT NULL REFERENCES episodes(id), horizon_min INTEGER NOT NULL,
+ sampled_at DOUBLE PRECISION NOT NULL, snapshot_json TEXT NOT NULL,
+ PRIMARY KEY (episode_id,horizon_min)
+);
 CREATE TABLE IF NOT EXISTS virtual_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS virtual_metrics (
  episode_id BIGINT PRIMARY KEY REFERENCES episodes(id),
@@ -162,6 +167,9 @@ def quote(api, episode):
             'total_trading_fees':str(fees+spot_entry_fee),
             'fee_breakdown':{'spot_entry':str(spot_entry_fee),'spot_exit':str(spot_exit_fee),'futures_entry':str(futures_entry_fee),'futures_exit':str(futures_exit_fee)},
             'slippage':slippage, 'at':time.time(), 'spread':str(spread), 'spot_bid':str(spot_bids[0][0]),
+            'spot_ask':str(spot_asks[0][0]),'futures_bid':str(future_bids[0][0]),
+            'spot_entry_vwap_now':str(spot_buy/qty),'future_entry_vwap_now':str(short/qty),
+            'raw_spread':str((future_bids[0][0]/spot_asks[0][0]-1)*100),
             'futures_ask':str(future_asks[0][0]), 'spot_exit':str(spot_sale/qty),
             'future_exit':str(cover/qty), 'fees':str(fees), 'trading_net':str(trading_net),
             'net_pnl':str(trading_net) if funding_known else None,

@@ -292,3 +292,23 @@ missing slippage and unknown funding settlement amounts remain null. Metrics
 for legacy episodes include known entry values and subsequent real observations,
 without claiming to reconstruct earlier peaks. Existing convergence and alert
 thresholds are unchanged, including negative-entry handling at zero.
+
+## Full checkpoint valuations
+
+New managed episodes retain their actual entry prices and nine due checkpoints:
+1/5/15/30/60 minutes and 3/6/12/24 hours. Fresh books supply both entry-side
+spread and executable Spot exit Bid / Futures exit Ask for the matched original
+quantity. Additive `virtual_checkpoint_details` stores the P&L snapshot, leg P&L,
+fees, slippage, entry/current funding rates and spread change. Unknown current
+funding or settlement P&L stays null; a positive rate is not an accrued payment.
+Post-close market samples are explicitly hypothetical, not additional realized
+profit or an open position. No last-trade prices or Telegram time-point alerts.
+
+The existing sampling window is 60 seconds; a response outside that window
+is missing, never backfilled. Old checkpoint prices are not rewritten. Statistics
+use the first actually observed convergence recorded by the continuous observer,
+not a manual closure. Rates have separate mature cohorts and display sample counts
+for each horizon; incomplete non-converged histories and late legacy adoption are
+excluded rather than classified as failures. Mean/median are observed convergence
+times only, and the 24-hour failure fraction uses the eligible 24-hour cohort.
+The existing negative-entry convergence rule [0;0.10%] is preserved.
