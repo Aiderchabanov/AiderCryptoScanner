@@ -110,9 +110,27 @@ class VirtualTests(unittest.TestCase):
                 with self.assertRaises(ValueError):virtual.confirm(self.api,token,'123','123',self.path)
                 with self.assertRaises(ValueError):virtual.preview(self.api,'add',self.ident,'123','123',self.path,1)
         with paper.session(self.path) as db:
-            self.assertEqual(virtual.used(db),D('201.8'))
+            self.assertEqual(virtual.used(db),D('100'))
             self.assertEqual(db.execute('SELECT parent_id FROM virtual_state ORDER BY episode_id DESC').fetchone()[0],self.ident)
-        self.assertIsNone(paper.record(dict(self.item,symbol='XYZUSDT'),self.path))
+        self.assertIsNotNone(paper.record(dict(self.item,symbol='XYZUSDT'),self.path))
+    def test_five_allocations_release_and_restart_migration(self):
+        for n in range(4):
+            self.assertIsNotNone(paper.record(dict(self.item,symbol=f'COIN{n}USDT'),self.path))
+        self.assertIsNone(paper.record(dict(self.item,symbol='SIXTHUSDT'),self.path))
+        self.assertIsNone(paper.record(self.item,self.path,parent_id=self.ident))
+        self.assertIsNone(paper.record(dict(self.item,symbol='BIGUSDT',paper_budget_usdt=D(250)),self.path))
+        with paper.session(self.path) as db:
+            self.assertEqual(virtual.used(db),D(250))
+            db.execute("UPDATE virtual_state SET used_capital='100.9'")
+        virtual.bootstrap(self.path)
+        self.assertTrue(all(D(e['used_capital'])==50 for e in virtual.rows(self.path)))
+        with patch.object(virtual,'quote',return_value=self.quote('.08')):
+            token=virtual.preview(self.api,'close',self.ident,'123','123',self.path)
+            virtual.confirm(self.api,token,'123','123',self.path)
+        with paper.session(self.path) as db:self.assertEqual(virtual.used(db),D(200))
+        self.assertIsNotNone(paper.record(dict(self.item,symbol='SIXTHUSDT'),self.path))
+        self.assertIsNone(paper.record(self.item,self.path,parent_id=virtual.rows(self.path)[0]['episode_id']))
+
     def test_unknown_negative_funding_and_anomaly_repeat(self):
         e=virtual.load(self.ident,self.path)
         with patch.object(basis,'evaluate',return_value=dict(self.item,pct=D(1),category='POSITIVE')),patch.object(basis,'fresh_funding',return_value=(D('-0.001'),time.time()+3600)):
@@ -156,8 +174,8 @@ class VirtualTests(unittest.TestCase):
         self.funding.return_value=(D('.0001'),time.time()+1620)
         virtual.funding_warnings(self.api,self.path)
         text=self.api.telegram.call_args.args[0]
-        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.1968%',text)
-        self.assertIn('капитала обеих ног',text)
+        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.3971%',text)
+        self.assertIn('виртуального капитала episode',text)
 
     def test_funding_warning_only_open_and_within_window(self):
         for deadline in (time.time()+1801,time.time()-1):

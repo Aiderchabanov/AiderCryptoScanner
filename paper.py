@@ -215,10 +215,10 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         budget = item.get('paper_budget_usdt')
         if budget is not None:
             budget = Decimal(str(budget))
-            if not budget.is_finite() or budget <= 0 or budget > Decimal('50'):
+            if not budget.is_finite() or budget != Decimal('50'):
                 return None
-            addition = virtual.number(item['spot_cost'], True) + virtual.number(item['future_notional'], True)
-            if virtual.used(db) + addition > virtual.deposit() / 2:
+            addition = Decimal('50')
+            if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
                 return None
             for key in ('spot_fee', 'future_fee', 'multiplier'):
                 value = virtual.number(item[key], positive=(key == 'multiplier'))

@@ -64,15 +64,15 @@ def number(value, positive=False):
 
 
 def used(db):
-    # Count both legs conservatively, including unresolved legacy episodes.
+    # Each open episode reserves one $50 allocation, including additional entries.
     rows = db.execute("SELECT e.*, v.state AS virtual_status FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short'").fetchall()
-    return sum((number(r['actual_spot_usdt'], True) + number(r['actual_futures_usdt'], True)
+    return sum((D('50')
                 for r in rows if r['virtual_status'] == 'open' or
                 (r['virtual_status'] is None and r['first_close_min'] is None)), D(0))
 
 
 def register(db, ident, item, parent=None):
-    capital = number(item['spot_cost'], True) + number(item['future_notional'], True)
+    capital = D('50')
     db.execute('''INSERT INTO virtual_state (episode_id,parent_id,state,used_capital,last_notice_spread,anomaly)
                   VALUES (?,?,'open',?,?,?)''',
                (ident, parent, str(capital), str(item['executable_spread_pct']), item.get('anomaly')))
@@ -84,7 +84,8 @@ def bootstrap(path=None):
         ensure(db); lock(db)
         active = db.execute("SELECT e.* FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short' AND e.first_close_min IS NULL AND v.episode_id IS NULL").fetchall()
         for e in active:
-            db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],str(number(e['actual_spot_usdt'], True)+number(e['actual_futures_usdt'], True)),e['executable_spread_pct']))
+            db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],'50',e['executable_spread_pct']))
+        db.execute("UPDATE virtual_state SET used_capital='50' WHERE state='open'")
         for e in db.execute("SELECT e.* FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE v.state='open'").fetchall():
             seed_metrics(db,e['id'],e['executable_spread_pct'])
             for minute in paper.EXTENDED_HORIZONS:
@@ -92,7 +93,7 @@ def bootstrap(path=None):
                 if due>=time.time():
                     db.execute("INSERT INTO checkpoints (episode_id,horizon_min,due_at,status) VALUES (?,?,?,'pending') ON CONFLICT (episode_id,horizon_min) DO NOTHING",(e['id'],minute,due))
         recovered = [dict(r) for r in db.execute("SELECT episode_id,last_notice_spread,last_warning FROM virtual_state WHERE state='open' ORDER BY episode_id").fetchall()]
-        logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), deposit()/2, recovered)
+        logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), min(deposit()/2, D(250)), recovered)
 
 
 def rows(path=None):
@@ -298,7 +299,7 @@ def funding_warnings(api,path=None):
                 else:
                     capital = number(e['used_capital'],True)
                     net = number(pnl['net_pnl'])
-                    pnl_text = f'Net P&L сейчас: {net:+.4f} USDT ({net/capital*100:+.4f}% от капитала обеих ног)'
+                    pnl_text = f'Net P&L сейчас: {net:+.4f} USDT ({net/capital*100:+.4f}% от виртуального капитала episode)'
             except Exception:
                 pnl_text = 'Net P&L сейчас: недоступен — свежие цены закрытия или комиссии не подтверждены'
             remaining = int(q['next_at']-time.time())
@@ -387,7 +388,7 @@ def menu(api, action, chat_id,path=None):
             lines.append(f"#{e['episode_id']} {e['symbol']}: свежий P&L недоступен")
         buttons.append([{'text':f"#{e['episode_id']} {e['symbol']}",'callback_data':f"{action}:{e['episode_id']}"}])
     with paper.session(path) as db:
-        ensure(db); lines.append(f"Used capital {used(db):.4f} / {deposit()/2:.2f} USDT (обе ноги)")
+        ensure(db); lines.append(f"Used capital {used(db):.4f} / {min(deposit()/2, D(250)):.2f} USDT (50 USDT на episode)")
     api.telegram('\n'.join(lines) if entries else lines[0]+'\nОткрытых сделок нет.',chat_id,reply_markup={'inline_keyboard':buttons} if buttons else None)
 
 
@@ -408,7 +409,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
         item=verified_entry(api,e)
         with paper.session(path) as db:
             ensure(db)
-            if used(db)+item['spot_cost']+item['future_notional'] > deposit()/2:
+            if used(db)+D(50) > min(deposit()/2, D(250)):
                 raise ValueError('50% capital limit')
         q={'spread':str(item['executable_spread_pct']), 'spot_entry':str(item['spot_entry']), 'future_entry':str(item['future_entry']), 'funding':str(item['funding']), 'level':level}
         text=f"Размеры ног: {item['spot_cost']:.4f} / {item['future_notional']:.4f} USDT; комиссии Spot/Futures {item['spot_fee']*100:.4f}% / {item['future_fee']*100:.4f}%; модель net {item['pct']:+.4f}%; защитный резерв 0.20%.\nДополнительный VIRTUAL BUY Spot {q['spot_entry']} + SHORT Futures {q['future_entry']}; funding {D(q['funding'])*100:+.4f}%; spread {D(q['spread']):+.4f}%."
