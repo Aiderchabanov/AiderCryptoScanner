@@ -196,6 +196,41 @@ class VirtualTests(unittest.TestCase):
         self.assertEqual(self.api.telegram.call_count,1)
         with paper.session(self.path) as db:self.assertEqual(db.execute('SELECT state FROM virtual_events').fetchone()[0],'claimed')
 
+    def test_leg_pnl_fees_slippage_saved_without_double_count(self):
+        q=virtual.quote(self.api,virtual.load(self.ident,self.path))
+        self.assertEqual(D(q['spot_pnl'])+D(q['futures_pnl']),D(q['trading_net']))
+        self.assertEqual(D(q['spot_pnl']),D('-.05'))
+        self.assertEqual(D(q['futures_pnl']),D('.24855'))
+        self.assertIn('spot_entry',q['fee_breakdown'])
+        self.assertIsNone(q['slippage']['spot_entry_usdt']) # Missing old input stays unknown.
+        self.assertEqual(q['funding_realized_usdt'],'0') # No settlement crossed, not an assumed payment.
+        self.assertEqual(D(q['slippage']['spot_exit_usdt']),0)
+
+    def test_metrics_peak_min_convergence_and_restart_persist(self):
+        for spread in ('12','10','0.08'):
+            with patch.object(virtual,'quote',return_value=self.quote(spread)):
+                virtual.observe(self.api,self.path)
+        virtual.bootstrap(self.path)
+        with paper.session(self.path) as db:
+            metric=dict(db.execute('SELECT * FROM virtual_metrics WHERE episode_id=?',(self.ident,)).fetchone())
+        self.assertEqual(D(metric['max_spread']),12)
+        self.assertEqual(D(metric['min_spread']),D('.08'))
+        self.assertEqual(D(metric['max_expansion_pp']),D('10.2'))
+        self.assertGreaterEqual(metric['convergence_seconds'],0)
+        self.assertEqual(json.loads(metric['latest_json'])['spread'],'0.08')
+
+    def test_extended_checkpoints_are_statistics_only_no_timed_alerts(self):
+        with paper.session(self.path) as db:
+            minutes=[r['horizon_min'] for r in db.execute('SELECT horizon_min FROM checkpoints ORDER BY horizon_min').fetchall()]
+        self.assertEqual(minutes,[1,5,15,30,60,180,360,720,1440])
+        with patch.object(paper,'executable_sample',return_value={'spot_ask':D(10),'spot_vwap':D(10),'futures_bid':D('10.1'),'futures_vwap':D('10.1'),'raw_spread_pct':D(1),'executable_spread_pct':D(1)}):
+            e=virtual.load(self.ident,self.path)
+            paper.poll(self.api,self.path,e['started_at']+180*60)
+        self.api.telegram.assert_not_called()
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute('SELECT status FROM checkpoints WHERE horizon_min=180').fetchone()[0],'observed')
+        self.assertEqual(self.state()['state'],'open')
+
     def test_postgres_schema_lock_precedes_ddl(self):
         db=MagicMock(); db.is_postgres=True
         virtual.ensure(db)

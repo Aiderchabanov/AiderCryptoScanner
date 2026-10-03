@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS virtual_events (
  buttons_json TEXT, state TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE TABLE IF NOT EXISTS virtual_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS virtual_metrics (
+ episode_id BIGINT PRIMARY KEY REFERENCES episodes(id),
+ tracking_started_at DOUBLE PRECISION NOT NULL, max_spread TEXT NOT NULL,
+ min_spread TEXT NOT NULL, max_expansion_pp TEXT NOT NULL,
+ convergence_seconds DOUBLE PRECISION, latest_json TEXT
+);
 '''
 
 
@@ -70,6 +76,7 @@ def register(db, ident, item, parent=None):
     db.execute('''INSERT INTO virtual_state (episode_id,parent_id,state,used_capital,last_notice_spread,anomaly)
                   VALUES (?,?,'open',?,?,?)''',
                (ident, parent, str(capital), str(item['executable_spread_pct']), item.get('anomaly')))
+    seed_metrics(db, ident, item['executable_spread_pct'])
 
 
 def bootstrap(path=None):
@@ -78,6 +85,12 @@ def bootstrap(path=None):
         active = db.execute("SELECT e.* FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short' AND e.first_close_min IS NULL AND v.episode_id IS NULL").fetchall()
         for e in active:
             db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],str(number(e['actual_spot_usdt'], True)+number(e['actual_futures_usdt'], True)),e['executable_spread_pct']))
+        for e in db.execute("SELECT e.* FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE v.state='open'").fetchall():
+            seed_metrics(db,e['id'],e['executable_spread_pct'])
+            for minute in paper.EXTENDED_HORIZONS:
+                due=e['started_at']+minute*60
+                if due>=time.time():
+                    db.execute("INSERT INTO checkpoints (episode_id,horizon_min,due_at,status) VALUES (?,?,?,'pending') ON CONFLICT (episode_id,horizon_min) DO NOTHING",(e['id'],minute,due))
         recovered = [dict(r) for r in db.execute("SELECT episode_id,last_notice_spread,last_warning FROM virtual_state WHERE state='open' ORDER BY episode_id").fetchall()]
         logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), deposit()/2, recovered)
 
@@ -125,11 +138,29 @@ def quote(api, episode):
     # Spot entry cost already includes base-asset entry fee; do not deduct twice.
     entry_cost = number(episode['actual_spot_usdt'], True)
     short_entry = number(episode['actual_futures_usdt'], True)
-    fees = short_entry * entry_future_fee + spot_sale * spot_fee + cover * future_fee
-    trading_net = spot_sale + short_entry - cover - entry_cost - fees
+    spot_entry_fee = max(D(0),entry_cost-qty*number(episode['spot_vwap'],True))
+    spot_exit_fee = spot_sale*spot_fee
+    futures_entry_fee = short_entry*entry_future_fee
+    futures_exit_fee = cover*future_fee
+    # Preserve the existing net calculation; entry Spot fee is already in cost.
+    fees = futures_entry_fee+spot_exit_fee+futures_exit_fee
+    spot_pnl = spot_sale-spot_exit_fee-entry_cost
+    futures_pnl = short_entry-cover-futures_entry_fee-futures_exit_fee
+    trading_net = spot_pnl+futures_pnl
+    slippage = {
+        'spot_entry_usdt':snap.get('spot_slippage_usdt'),
+        'futures_entry_usdt':snap.get('futures_slippage_usdt'),
+        'spot_exit_usdt':str(max(D(0),qty*spot_bids[0][0]-spot_sale)),
+        'futures_exit_usdt':str(max(D(0),cover-qty*future_asks[0][0]))}
+
     funding_known = time.time() < float(episode['next_funding_at'])
     spread = (short / spot_buy - 1) * 100
-    return {'at':time.time(), 'spread':str(spread), 'spot_bid':str(spot_bids[0][0]),
+    return {'spot_pnl':str(spot_pnl),'futures_pnl':str(futures_pnl),
+            'funding_rate_at_entry':episode['funding_rate'],
+            'funding_realized_usdt':'0' if funding_known else None,
+            'total_trading_fees':str(fees+spot_entry_fee),
+            'fee_breakdown':{'spot_entry':str(spot_entry_fee),'spot_exit':str(spot_exit_fee),'futures_entry':str(futures_entry_fee),'futures_exit':str(futures_exit_fee)},
+            'slippage':slippage, 'at':time.time(), 'spread':str(spread), 'spot_bid':str(spot_bids[0][0]),
             'futures_ask':str(future_asks[0][0]), 'spot_exit':str(spot_sale/qty),
             'future_exit':str(cover/qty), 'fees':str(fees), 'trading_net':str(trading_net),
             'net_pnl':str(trading_net) if funding_known else None,
@@ -147,10 +178,29 @@ def event(db, key, ident, body, buttons=None):
                (key,ident,body,json.dumps(buttons) if buttons else None))
 
 
+def seed_metrics(db,ident,spread):
+    db.execute("""INSERT INTO virtual_metrics (episode_id,tracking_started_at,max_spread,min_spread,max_expansion_pp)
+                VALUES (?,?,?,?, '0') ON CONFLICT (episode_id) DO NOTHING""",(ident,time.time(),str(spread),str(spread)))
+
+
+def update_metrics(db,e,q,converged=False):
+    seed_metrics(db,e['episode_id'],e['executable_spread_pct'])
+    old=db.execute('SELECT * FROM virtual_metrics WHERE episode_id=?',(e['episode_id'],)).fetchone()
+    spread=number(q['spread']);entry=number(e['executable_spread_pct'])
+    db.execute("""UPDATE virtual_metrics SET max_spread=?,min_spread=?,max_expansion_pp=?,
+                  convergence_seconds=COALESCE(convergence_seconds,?),latest_json=? WHERE episode_id=?""",
+               (str(max(number(old['max_spread']),spread)),str(min(number(old['min_spread']),spread)),
+                str(max(number(old['max_expansion_pp']),spread-entry)),
+                max(0,q['at']-e['started_at']) if converged else None,json.dumps(q),e['episode_id']))
+
+
 def close_db(db, e, q):
     result = db.execute("UPDATE virtual_state SET state='closed',closed_at=?,close_json=?,current_json=? WHERE episode_id=? AND state='open'",(q['at'],json.dumps(q),json.dumps(q),e['episode_id']))
     if result.rowcount != 1:
         return False
+    entry=number(e['executable_spread_pct']);spread=number(q['spread'])
+    converged=spread<=paper.CLOSED_PCT if entry>0 else D(0)<=spread<=paper.CLOSED_PCT
+    update_metrics(db,e,q,converged)
     db.execute("UPDATE episodes SET status='closed', first_close_min=COALESCE(first_close_min,?) WHERE id=?",(max(1,math.ceil((q['at']-e['started_at'])/60)), e['episode_id']))
     if D(q['spread']) <= paper.CLOSED_PCT and (D(e['executable_spread_pct']) > 0 or D(q['spread']) >= 0):
         db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"gapreset:{e['episode_id']}",'1'))
@@ -185,6 +235,7 @@ def observe(api, path=None):
                 # entering at -1% is not already a closed trade.
                 entry = D(e['executable_spread_pct'])
                 converged = spread <= paper.CLOSED_PCT if entry > 0 else D(0) <= spread <= paper.CLOSED_PCT
+                update_metrics(db,e,q,converged)
                 if converged:
                     close_db(db,e,q)
                     continue

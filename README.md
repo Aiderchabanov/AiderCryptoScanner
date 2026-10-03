@@ -270,3 +270,23 @@ Quote freshness is checked against snapshot timestamps when supplied (BingX
 depth requires one); endpoints without timestamps can only establish a fresh
 HTTP response, not prove the age of the exchange's underlying snapshot.
 Telegram delivery remains at-most-once; ambiguous sends are not retried.
+
+### Convergence analytics
+
+Funding >0 remains exclusively an admission filter. Positions are never held
+for a funding payment; the continuous observer uses fresh executable bid/ask.
+New managed episodes also receive statistics-only 3/6/12/24h checkpoints.
+Existing open episodes receive only future checkpoints on recovery, with no
+backfill and no Telegram messages caused by checkpoint times. The earlier
+1/5/15/30/60m statistics retain their existing denominator.
+
+`virtual_metrics` stores observed maximum spread/expansion, minimum spread,
+actual elapsed time at observed convergence, and latest/closing analytics.
+Quote JSON includes each leg's trading P&L, entry/exit fee breakdown, entry and
+exit slippage, entry funding, known/unknown realized funding and Net P&L.
+Spot entry fee is already included in its entry cost and is not deducted twice.
+Slippage is included in executable prices, never charged a second time. Old
+missing slippage and unknown funding settlement amounts remain null. Metrics
+for legacy episodes include known entry values and subsequent real observations,
+without claiming to reconstruct earlier peaks. Existing convergence and alert
+thresholds are unchanged, including negative-entry handling at zero.

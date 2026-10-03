@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 HORIZONS = (1, 5, 15, 30, 60)
+EXTENDED_HORIZONS = (180, 360, 720, 1440)
 WINDOW_SECONDS = 60
 EPISODE_COOLDOWN_SECONDS = 7200
 MIN_HISTORY = 30
@@ -255,7 +256,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         episode_id = cursor.fetchone()['id'] if getattr(db, 'is_postgres', False) else cursor.lastrowid
         db.executemany('''INSERT INTO checkpoints
             (episode_id, horizon_min, due_at, status) VALUES (?,?,?,?)''',
-            [(episode_id, minute, now + minute * 60, 'pending') for minute in HORIZONS])
+            [(episode_id, minute, now + minute * 60, 'pending') for minute in HORIZONS + (EXTENDED_HORIZONS if budget is not None else ())])
         if budget is not None:
             virtual.register(db, episode_id, item, parent_id)
         return episode_id
@@ -368,7 +369,7 @@ def statistics_for(db, symbol=None, category=None):
     rows = db.execute(query, params).fetchall()
     complete = []
     for row in rows:
-        samples = first_value(db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status='observed'",
+        samples = first_value(db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND horizon_min<=60 AND status='observed'",
                                          (row['id'],)).fetchone())
         if samples == len(HORIZONS):
             complete.append(row)

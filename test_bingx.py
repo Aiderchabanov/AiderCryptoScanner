@@ -192,7 +192,7 @@ class BingXTests(unittest.TestCase):
             third = dict(item, symbol='THIRDUSDT')
             self.assertIsNone(paper.record(third, path))  # Both legs would exceed $250.
             with paper.session(path) as db:
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 10)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 18)
                 self.assertNotIn('test-secret', db.execute('SELECT cost_snapshot_json FROM episodes').fetchone()[0])
         text = basis.format_alert(item)
         self.assertIn('PAPER / VIRTUAL ONLY', text)
