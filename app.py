@@ -53,6 +53,7 @@ def get_json(url, **kwargs):
     host_key = parsed.netloc
     path_key = (parsed.netloc, parsed.path)
     now = time.monotonic()
+    public_diagnostic = host_key == 'fapi.binance.com' and parsed.path in ('/fapi/v1/ticker/bookTicker','/fapi/v1/exchangeInfo')
     if host_key == 'fapi.binance.com' and host_key not in api_blocked_until:
         try:
             until = paper.load_api_backoff(host_key)
@@ -63,8 +64,32 @@ def get_json(url, **kwargs):
             logging.warning('Binance futures backoff storage unavailable')
             api_blocked_until[host_key] = now + 3600
     if now < max(api_blocked_until.get(host_key, 0), api_blocked_until.get(path_key, 0)):
+        if public_diagnostic:
+            remaining=max(api_blocked_until.get(host_key,0),api_blocked_until.get(path_key,0))-now
+            until=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time()+remaining))
+            logging.warning('Binance futures public GET %s: HTTP=not_requested exception=RuntimeError message=active persisted/local cooldown; remaining=%.0fs until=%s; Retry-After=honored; no HTTP request sent',parsed.path,remaining,until)
         raise RuntimeError('Exchange API temporarily unavailable')
-    response = requests.get(url, timeout=10, **kwargs)
+    try:
+        response = requests.get(url, timeout=10, **kwargs)
+    except requests.RequestException as exc:
+        if public_diagnostic:
+            label='timeout' if isinstance(exc,requests.Timeout) else 'transport failure'
+            logging.warning('Binance futures public GET %s: HTTP=no_response exception=%s message=%s Retry-After=unavailable',parsed.path,type(exc).__name__,label)
+        raise
+    if public_diagnostic:
+        retry=response.headers.get('Retry-After','')
+        safe_retry=retry if isinstance(retry,str) and retry.isdigit() and len(retry)<=12 else 'absent_or_non_numeric'
+        code=None
+        if response.status_code>=400:
+            try:
+                payload=response.json()
+                candidate=payload.get('code') if isinstance(payload,dict) else None
+                if isinstance(candidate,int):code=candidate
+            except (ValueError,TypeError):pass
+        label={418:'IP auto-ban',429:'rate limit',451:'restricted location',403:'access forbidden',401:'unauthorized'}.get(response.status_code,'HTTP error' if response.status_code>=400 else 'response received')
+        logging.log(logging.WARNING if response.status_code>=400 else logging.INFO,
+            'Binance futures public GET %s: HTTP=%s exception=%s message=%s API_code=%s Retry-After=%s',
+            parsed.path,response.status_code,'HTTPError' if response.status_code>=400 else 'none',label,code if code is not None else '-',safe_retry)
     if response.status_code in (401, 403, 418, 429):
         retry = response.headers.get('Retry-After', '')
         base_delay = 3600 if response.status_code in (401, 403, 418) else 60
@@ -545,7 +570,7 @@ def basis_loop():
     while True:
         try:
             results = basis.scan(current_scanner_api())
-            logging.info('basis scan: %s conditional alerts', len(results))
+            # basis.scan logs candidates and actually dispatched conditional alerts.
         except Exception:
             logging.exception('basis scan failed')
         time.sleep(max(60, SCAN))

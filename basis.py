@@ -36,11 +36,17 @@ def futures_markets(api):
                 raise ValueError('Futures tickers unavailable')
             if exchange == 'Binance':
                 b = rows
+                logging.info('Binance futures market OK: symbols=%s',sum(isinstance(r,dict) and r.get('symbol','').endswith('USDT') for r in rows))
             else:
                 g = rows
         except Exception as exc:
-            logging.warning('Basis %s futures market unavailable (%s)',
-                            exchange, type(exc).__name__)
+            if exchange=='Binance':
+                response=getattr(exc,'response',None)
+                status=getattr(response,'status_code',None)
+                message='active API cooldown (no HTTP request)' if isinstance(exc,RuntimeError) and exc.args==('Exchange API temporarily unavailable',) else ('invalid public ticker response' if isinstance(exc,ValueError) else 'public API request failed; see HTTP diagnostic')
+                logging.warning('Basis Binance futures market unavailable: endpoint=/fapi/v1/ticker/bookTicker HTTP=%s exception=%s message=%s',status if status is not None else 'no_response',type(exc).__name__,message)
+            else:
+                logging.warning('Basis %s futures market unavailable (%s)',exchange,type(exc).__name__)
     return ({r['symbol']: r for r in b if r.get('symbol', '').endswith('USDT')},
             {r['contract'].replace('_', ''): r for r in g
              if r.get('contract', '').endswith('_USDT')})
@@ -278,6 +284,7 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
 
 def scan(api):
     if not paper.storage_ready():
+        logging.info('basis scan: candidates=0, conditional alerts=0 (storage unavailable)')
         return []  # Never alert without durable episode/checkpoint records.
     if getattr(api, 'multi_exchange', False) is True:
         spots, futures = api.market_maps()
@@ -287,6 +294,7 @@ def scan(api):
                       if spot != future and api.credentials_ready(spot) and api.credentials_ready(future)]
     else:
         if not all((api.BINANCE_KEY, api.BINANCE_SECRET, api.GATE_KEY, api.GATE_SECRET)):
+            logging.info('basis scan: candidates=0, conditional alerts=0 (read-only credentials unavailable)')
             return []
         spots = api.tickers()
         futures = futures_markets(api)
@@ -330,6 +338,7 @@ def scan(api):
     now = time.time()
     alerts = [item for category in ('POSITIVE', 'NEGATIVE')
               for item in [x for x in found if x.get('category', 'POSITIVE') == category][:3]]
+    dispatched=0
     for item in alerts:
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
@@ -352,9 +361,11 @@ def scan(api):
                 continue  # Same continuous spread episode.
             api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol'], item.get('category', 'POSITIVE')))
             last_alert[key] = now
+            dispatched+=1
         except Exception as exc:
             logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
                             type(exc).__name__)
+    logging.info('basis scan: candidates=%s, conditional alerts=%s',len(shortlist),dispatched)
     return found
 
 
