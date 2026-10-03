@@ -128,6 +128,8 @@ def bootstrap(path=None):
         recovered = [dict(r) for r in db.execute("SELECT episode_id,last_notice_spread,last_warning FROM virtual_state WHERE state='open' ORDER BY episode_id").fetchall()]
         logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), min(deposit()/2, D(250)), recovered)
 
+    a=accounting(path)
+    logging.info('Virtual accounting: confirmed_realized_pnl=%s; current_virtual_balance=%s; closed_complete=%s; closed_incomplete=%s; open=%s; used_capital=%s',a['confirmed_realized_pnl'],a['current_virtual_balance'],a['closed_complete'],a['incomplete_closed_pnl_count'],a['open_episodes'],a['used_capital'])
 
 def rows(path=None):
     with paper.session(path) as db:
@@ -231,7 +233,77 @@ def update_metrics(db,e,q,converged=False):
                 max(0,q['at']-e['started_at']) if converged else None,json.dumps(q),e['episode_id']))
 
 
+def realized_result(q):
+    # Complete Net P&L only; unknown settlement is never replaced with zero.
+    if q.get('funding_status') == 'UNKNOWN_SETTLEMENT_PNL' or q.get('net_pnl') is None:
+        return None
+    try:
+        if q.get('funding_realized_usdt') is None:
+            return None
+        for key in ('spot_pnl', 'futures_pnl', 'funding_realized_usdt', 'total_trading_fees'):
+            number(q[key])
+        result=number(q['net_pnl'])
+        if result != number(q['spot_pnl'])+number(q['futures_pnl'])+number(q['funding_realized_usdt']):
+            return None
+        return str(result)
+    except (KeyError, ValueError, ArithmeticError):
+        return None
+
+
+def accounting(path=None, api=None):
+    with paper.session(path) as db:
+        ensure(db)
+        closed=db.execute("SELECT close_json FROM virtual_state WHERE state='closed'").fetchall()
+        occupied=used(db)
+        opened=[dict(r) for r in db.execute("SELECT e.*,v.* FROM episodes e JOIN virtual_state v ON v.episode_id=e.id WHERE v.state='open'").fetchall()]
+    confirmed=D(0); complete=0
+    for row in closed:
+        try:
+            q=json.loads(row['close_json'] or '{}')
+            value=q.get('realized_net_pnl_usdt')
+            if value is None or realized_result(q) is None:
+                continue
+            confirmed+=number(value);complete+=1
+        except (ValueError, TypeError, ArithmeticError):
+            continue
+    unrealized=D(0);unknown=0
+    for e in opened:
+        if api is None:
+            unknown+=1;continue
+        try:
+            q=quote(api,e)
+            if time.time()-q['at']>30 or q['net_pnl'] is None:
+                unknown+=1;continue
+            unrealized+=number(q['net_pnl'])
+        except Exception:
+            unknown+=1
+    limit=min(deposit()/2,D(250))
+    return {'confirmed_realized_pnl':confirmed,'cumulative_realized_pnl':confirmed,
+            'current_virtual_balance':D(500)+confirmed,'initial_virtual_deposit':D(500),
+            'incomplete_closed_pnl_count':len(closed)-complete,'closed_complete':complete,
+            'open_episodes':len(opened),'unrealized_pnl_open':unrealized if unknown==0 else None,
+            'known_unrealized_subtotal':unrealized,'unrealized_unknown_count':unknown,
+            'used_capital':occupied,'capital_limit':limit,'free_capital':max(D(0),limit-occupied)}
+
+
+def status(api,chat_id,path=None):
+    a=accounting(path,api)
+    unrealized=(f"{a['unrealized_pnl_open']:+.2f} USDT" if a['unrealized_pnl_open'] is not None
+                else f"UNKNOWN ({a['unrealized_unknown_count']} incomplete; known subtotal {a['known_unrealized_subtotal']:+.2f} USDT)")
+    api.telegram(
+        f"PAPER / VIRTUAL ONLY\nVirtual deposit start: 500.00 USDT\n"
+        f"Confirmed realized P&L: {a['confirmed_realized_pnl']:+.2f} USDT\n"
+        f"Current virtual balance: {a['current_virtual_balance']:.2f} USDT\n"
+        f"Unrealized P&L open: {unrealized}\nOpen episodes: {a['open_episodes']}\n"
+        f"Closed complete: {a['closed_complete']}\nClosed incomplete: {a['incomplete_closed_pnl_count']}\n"
+        f"Used capital: {a['used_capital']:.2f} / {a['capital_limit']:.2f} USDT\n"
+        f"Free capital: {a['free_capital']:.2f} USDT\n"
+        "Balance includes confirmed results only; free capital is the unused working limit.",chat_id)
+
+
 def close_db(db, e, q):
+    q=dict(q)
+    q['realized_net_pnl_usdt']=realized_result(q)
     result = db.execute("UPDATE virtual_state SET state='closed',closed_at=?,close_json=?,current_json=? WHERE episode_id=? AND state='open'",(q['at'],json.dumps(q),json.dumps(q),e['episode_id']))
     if result.rowcount != 1:
         return False
@@ -512,10 +584,12 @@ def handle(api,update,chat_id,path=None):
     if str(chat)!=str(chat_id) or not operator or str(user)!=operator:
         return False
     text=callback.get('data','') if callback else message.get('text','').split('@')[0].split()[0] if message.get('text') else ''
-    if text not in ('/open','/close') and not text.startswith(('view:','close:','add:','confirm:')):
+    if text not in ('/open','/close','/status') and not text.startswith(('view:','close:','add:','confirm:')):
         return False
     try:
-        if text in ('/open','/close'):
+        if text == '/status':
+            status(api,chat,path)
+        elif text in ('/open','/close'):
             menu(api,'view' if text=='/open' else 'close',chat,path)
         elif text.startswith('confirm:'):
             confirm(api,text.split(':')[1],chat,user,path)
