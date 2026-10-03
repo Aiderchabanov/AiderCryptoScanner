@@ -110,26 +110,49 @@ class VirtualTests(unittest.TestCase):
                 with self.assertRaises(ValueError):virtual.confirm(self.api,token,'123','123',self.path)
                 with self.assertRaises(ValueError):virtual.preview(self.api,'add',self.ident,'123','123',self.path,1)
         with paper.session(self.path) as db:
-            self.assertEqual(virtual.used(db),D('100'))
+            self.assertEqual(virtual.used(db),D('201.8'))
             self.assertEqual(db.execute('SELECT parent_id FROM virtual_state ORDER BY episode_id DESC').fetchone()[0],self.ident)
-        self.assertIsNotNone(paper.record(dict(self.item,symbol='XYZUSDT'),self.path))
-    def test_five_allocations_release_and_restart_migration(self):
-        for n in range(4):
-            self.assertIsNotNone(paper.record(dict(self.item,symbol=f'COIN{n}USDT'),self.path))
-        self.assertIsNone(paper.record(dict(self.item,symbol='SIXTHUSDT'),self.path))
-        self.assertIsNone(paper.record(self.item,self.path,parent_id=self.ident))
-        self.assertIsNone(paper.record(dict(self.item,symbol='BIGUSDT',paper_budget_usdt=D(250)),self.path))
+        self.assertIsNone(paper.record(dict(self.item,symbol='XYZUSDT'),self.path))
+    def test_actual_capital_leverage_limits_release_and_restart(self):
+        for lev,count,per_episode in (('1',2,D(100)),('2',3,D(75)),('5',4,D(60))):
+            path=Path(self.tmp.name)/f'leverage{lev}.sqlite'
+            item=dict(self.item,future_notional=D(50))
+            with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':lev}):
+                ids=[paper.record(dict(item,symbol=f'COIN{n}USDT'),path) for n in range(count)]
+                self.assertTrue(all(x is not None for x in ids))
+                self.assertIsNone(paper.record(dict(item,symbol='NEXTUSDT'),path))
+                with paper.session(path) as db:self.assertEqual(virtual.used(db),count*per_episode)
+                virtual.bootstrap(path)
+            # Existing positions retain entry leverage after environment changes.
+            with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':'10'}):
+                virtual.bootstrap(path)
+                with paper.session(path) as db:self.assertEqual(virtual.used(db),count*per_episode)
+            with paper.session(path) as db:
+                db.execute("UPDATE virtual_state SET state='closed' WHERE episode_id=?",(ids[0],))
+                self.assertEqual(virtual.used(db),(count-1)*per_episode)
+            with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':lev}):
+                self.assertIsNotNone(paper.record(dict(item,symbol='NEXTUSDT'),path))
+
+    def test_no_fixed_five_episode_limit_for_actual_smaller_notionals(self):
+        path=Path(self.tmp.name)/'six.sqlite'
+        item=dict(self.item,spot_cost=D(40),future_notional=D(40))
+        with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':'25'}):
+            for n in range(6):self.assertIsNotNone(paper.record(dict(item,symbol=f'SMALL{n}USDT'),path))
+            with paper.session(path) as db:self.assertEqual(virtual.used(db),D('249.6'))
+            self.assertIsNone(paper.record(dict(item,symbol='SEVENTHUSDT'),path))
+
+    def test_default_one_explicit_log_invalid_leverage_and_legacy_migration(self):
+        with patch.dict('os.environ',{},clear=True),patch.object(virtual,'_leverage_logged',None),self.assertLogs(level='INFO') as logs:
+            self.assertEqual(virtual.leverage(),1)
+        self.assertIn('default',' '.join(logs.output))
+        for invalid in ('0','-1','NaN','Infinity','unknown',''):
+            with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':invalid}):
+                with self.assertRaises(Exception):virtual.leverage()
         with paper.session(self.path) as db:
-            self.assertEqual(virtual.used(db),D(250))
-            db.execute("UPDATE virtual_state SET used_capital='100.9'")
-        virtual.bootstrap(self.path)
-        self.assertTrue(all(D(e['used_capital'])==50 for e in virtual.rows(self.path)))
-        with patch.object(virtual,'quote',return_value=self.quote('.08')):
-            token=virtual.preview(self.api,'close',self.ident,'123','123',self.path)
-            virtual.confirm(self.api,token,'123','123',self.path)
-        with paper.session(self.path) as db:self.assertEqual(virtual.used(db),D(200))
-        self.assertIsNotNone(paper.record(dict(self.item,symbol='SIXTHUSDT'),self.path))
-        self.assertIsNone(paper.record(self.item,self.path,parent_id=virtual.rows(self.path)[0]['episode_id']))
+            db.execute("DELETE FROM virtual_meta WHERE name=?",(f'capital_leverage:{self.ident}',))
+            db.execute("UPDATE virtual_state SET used_capital='50'")
+        with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':'1'}):virtual.bootstrap(self.path)
+        self.assertEqual(D(self.state()['used_capital']),D('100.9'))
 
     def test_checkpoint_full_exit_snapshot_no_telegram_or_capital_change(self):
         e=virtual.load(self.ident,self.path)
@@ -147,7 +170,7 @@ class VirtualTests(unittest.TestCase):
             self.assertIn('slippage',q);self.assertIn('total_trading_fees',q)
             self.assertEqual(q['funding_rate_current'],'0.0001')
             self.assertEqual(D(q['spread_change_pp']),D(q['spread'])-D('1.8'))
-            self.assertEqual(virtual.used(db),D(50))
+            self.assertEqual(virtual.used(db),D('100.9'))
         self.api.telegram.assert_not_called()
         self.assertEqual(self.state()['state'],'open')
 
@@ -225,7 +248,7 @@ class VirtualTests(unittest.TestCase):
         self.funding.return_value=(D('.0001'),time.time()+1620)
         virtual.funding_warnings(self.api,self.path)
         text=self.api.telegram.call_args.args[0]
-        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.3971%',text)
+        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.1968%',text)
         self.assertIn('виртуального капитала episode',text)
 
     def test_funding_warning_only_open_and_within_window(self):

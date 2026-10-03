@@ -68,19 +68,44 @@ def number(value, positive=False):
     return value
 
 
+_leverage_logged = None
+
+def leverage():
+    global _leverage_logged
+    raw=os.getenv('PAPER_FUTURES_LEVERAGE')
+    value=number('1' if raw is None else raw,True)
+    if value<1:raise ValueError('PAPER_FUTURES_LEVERAGE must be >= 1')
+    mode='default (PAPER_FUTURES_LEVERAGE absent)' if raw is None else 'configured'
+    if _leverage_logged!=(str(value),mode):
+        logging.info('PAPER Futures leverage: %sx; %s; virtual margin accounting only',value,mode)
+        _leverage_logged=(str(value),mode)
+    return value
+
+
+def capital(spot,notional,lev=None):
+    return number(spot,True)+number(notional,True)/(leverage() if lev is None else number(lev,True))
+
+
+def episode_leverage(db,ident):
+    row=db.execute('SELECT value FROM virtual_meta WHERE name=?',(f'capital_leverage:{ident}',)).fetchone()
+    return number(row['value'],True) if row else leverage()
+
+
 def used(db):
-    # Each open episode reserves one $50 allocation, including additional entries.
+    # Actual Spot capital plus Futures margin; entry leverage survives restarts.
     rows = db.execute("SELECT e.*, v.state AS virtual_status FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short'").fetchall()
-    return sum((D('50')
+    return sum((capital(r['actual_spot_usdt'],r['actual_futures_usdt'],episode_leverage(db,r['id']))
                 for r in rows if r['virtual_status'] == 'open' or
                 (r['virtual_status'] is None and r['first_close_min'] is None)), D(0))
 
 
 def register(db, ident, item, parent=None):
-    capital = D('50')
+    lev=leverage()
+    reserved = capital(item['spot_cost'],item['future_notional'],lev)
     db.execute('''INSERT INTO virtual_state (episode_id,parent_id,state,used_capital,last_notice_spread,anomaly)
                   VALUES (?,?,'open',?,?,?)''',
-               (ident, parent, str(capital), str(item['executable_spread_pct']), item.get('anomaly')))
+               (ident, parent, str(reserved), str(item['executable_spread_pct']), item.get('anomaly')))
+    db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?)',(f'capital_leverage:{ident}',str(lev)))
     seed_metrics(db, ident, item['executable_spread_pct'])
 
 
@@ -89,9 +114,12 @@ def bootstrap(path=None):
         ensure(db); lock(db)
         active = db.execute("SELECT e.* FROM episodes e LEFT JOIN virtual_state v ON v.episode_id=e.id WHERE e.direction='spot_buy/futures_short' AND e.first_close_min IS NULL AND v.episode_id IS NULL").fetchall()
         for e in active:
-            db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],'50',e['executable_spread_pct']))
-        db.execute("UPDATE virtual_state SET used_capital='50' WHERE state='open'")
+            db.execute("INSERT INTO virtual_state (episode_id,state,used_capital,last_notice_spread) VALUES (?,'open',?,?) ON CONFLICT (episode_id) DO NOTHING", (e['id'],str(capital(e['actual_spot_usdt'],e['actual_futures_usdt'])),e['executable_spread_pct']))
+        leverage() # Explicit default/configured startup log.
         for e in db.execute("SELECT e.* FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE v.state='open'").fetchall():
+            lev=episode_leverage(db,e['id'])
+            db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"capital_leverage:{e['id']}",str(lev)))
+            db.execute('UPDATE virtual_state SET used_capital=? WHERE episode_id=?',(str(capital(e['actual_spot_usdt'],e['actual_futures_usdt'],lev)),e['id']))
             seed_metrics(db,e['id'],e['executable_spread_pct'])
             for minute in paper.EXTENDED_HORIZONS:
                 due=e['started_at']+minute*60
@@ -417,7 +445,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
         item=verified_entry(api,e)
         with paper.session(path) as db:
             ensure(db)
-            if used(db)+D(50) > min(deposit()/2, D(250)):
+            if used(db)+capital(item['spot_cost'],item['future_notional']) > min(deposit()/2, D(250)):
                 raise ValueError('50% capital limit')
         q={'spread':str(item['executable_spread_pct']), 'spot_entry':str(item['spot_entry']), 'future_entry':str(item['future_entry']), 'funding':str(item['funding']), 'level':level}
         text=f"Размеры ног: {item['spot_cost']:.4f} / {item['future_notional']:.4f} USDT; комиссии Spot/Futures {item['spot_fee']*100:.4f}% / {item['future_fee']*100:.4f}%; модель net {item['pct']:+.4f}%; защитный резерв 0.20%.\nДополнительный VIRTUAL BUY Spot {q['spot_entry']} + SHORT Futures {q['future_entry']}; funding {D(q['funding'])*100:+.4f}%; spread {D(q['spread']):+.4f}%."

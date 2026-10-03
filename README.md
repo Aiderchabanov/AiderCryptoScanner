@@ -204,11 +204,14 @@ Render's ephemeral free filesystem. No API credentials are stored in episodes.
 
 `virtual.py` adds only additive Neon tables (`virtual_state`, `virtual_proposals`,
 `virtual_events`, `virtual_meta`). Existing episodes and checkpoints remain.
-`PAPER_DEPOSIT_USDT` defaults to 500; each open episode reserves exactly 50 USDT,
-including manually confirmed additional entries. At most five episodes may be
-open, totaling 250 USDT (50% of the 500 USDT virtual deposit). Closure releases
-50 USDT. Actual leg notionals, entry prices and costs remain separately stored;
-startup updates open allocation records without rewriting trade history.
+`PAPER_DEPOSIT_USDT` defaults to 500. Used capital is actual Spot cost plus
+Futures notional divided by `PAPER_FUTURES_LEVERAGE`. Missing leverage explicitly
+logs default 1x; invalid or below-1 leverage blocks new entries. The aggregate
+limit is 250 USDT (or 50% of a smaller configured deposit), without a fixed episode
+count. Each leg remains capped at 50 USDT. Entry leverage is persisted in existing
+virtual metadata; changing the setting affects new entries only. Startup migrates
+open allocation records without rewriting entry prices, P&L or closed history.
+This is virtual margin accounting, not a liquidation or maintenance-margin model.
 
 Open positions continue after 60 minutes and after restart. Exit prices use Spot
 Bid / Futures Ask for the actual entry quantity, including executable depth and

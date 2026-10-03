@@ -217,7 +217,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
             budget = Decimal(str(budget))
             if not budget.is_finite() or budget != Decimal('50'):
                 return None
-            addition = Decimal('50')
+            addition = virtual.capital(item['spot_cost'],item['future_notional'])
             if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
                 return None
             for key in ('spot_fee', 'future_fee', 'multiplier'):
