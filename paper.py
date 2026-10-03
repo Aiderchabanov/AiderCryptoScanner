@@ -11,7 +11,7 @@ import os
 import sqlite3
 import statistics
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -166,7 +166,7 @@ def save_api_backoff(host, until_at):
 
 
 
-def record(item, path=None, at=None):
+def record(item, path=None, at=None, parent_id=None, connection=None):
     """Create one episode for a qualified alert; return its ID or None."""
     now = time.time() if at is None else at
     try:
@@ -176,6 +176,8 @@ def record(item, path=None, at=None):
         return None
     if not rate.is_finite() or rate <= 0 or not math.isfinite(next_at) or next_at <= now:
         return None  # Defense in depth; basis.scan also rechecks live funding.
+    if 'verified_at' in item and (not math.isfinite(item['verified_at']) or not 0 <= now-item['verified_at'] <= 30):
+        return None
     raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
     executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
     if raw < 0 or executable < 0:
@@ -184,17 +186,28 @@ def record(item, path=None, at=None):
             return None
     elif raw == 0 or executable == 0:
         return None
-    with session(path) as db:
+    import virtual
+    with (nullcontext(connection) if connection is not None else session(path)) as db:
+        virtual.ensure(db)
+        virtual.lock(db)
         if getattr(db, 'is_postgres', False):
             # Serialize episode creation for this pair, including the first row.
             db.execute('SELECT pg_advisory_xact_lock(hashtext(?))',
                        (item['symbol'] + ':' + item['spot'] + ':' + item['future'],))
-        else:
+        elif connection is None:
             db.execute('BEGIN IMMEDIATE')
+        if parent_id is None and db.execute('''SELECT 1 FROM episodes e JOIN virtual_state v ON e.id=v.episode_id
+                WHERE e.symbol=? AND e.spot_exchange=? AND e.futures_exchange=? AND v.state='open' ''',
+                (item['symbol'], item['spot'], item['future'])).fetchone():
+            return None
         prior = db.execute('''SELECT * FROM episodes WHERE symbol=? AND spot_exchange=?
                AND futures_exchange=? ORDER BY started_at DESC LIMIT 1''',
                (item['symbol'], item['spot'], item['future'])).fetchone()
-        if prior and (prior['status'] == 'observing' or
+        if parent_id is None and prior:
+            state = db.execute('SELECT * FROM virtual_state WHERE episode_id=?', (prior['id'],)).fetchone()
+            if state and state['state']=='closed' and not db.execute('SELECT 1 FROM virtual_meta WHERE name=?', (f"gapreset:{prior['id']}",)).fetchone():
+                return None
+        if parent_id is None and prior and (prior['status'] == 'observing' or
                       (prior['first_close_min'] is None and
                        now < prior['started_at'] + EPISODE_COOLDOWN_SECONDS)):
             return None
@@ -203,19 +216,17 @@ def record(item, path=None, at=None):
             budget = Decimal(str(budget))
             if not budget.is_finite() or budget <= 0 or budget > Decimal('50'):
                 return None
-            # Lock exchange budgets in a stable order across concurrent scans.
-            if getattr(db, 'is_postgres', False):
-                for exchange in sorted({item['spot'], item['future']}):
-                    db.execute('SELECT pg_advisory_xact_lock(hashtext(?))',
-                               ('paper-budget:' + exchange,))
-            active = db.execute("SELECT * FROM episodes WHERE direction='spot_buy/futures_short' AND first_close_min IS NULL").fetchall()
-            for exchange, addition in ((item['spot'], item['spot_cost']),
-                                       (item['future'], item['future_notional'])):
-                used = sum((Decimal(r['actual_spot_usdt']) if r['spot_exchange'] == exchange else Decimal(0))
-                           + (Decimal(r['actual_futures_usdt']) if r['futures_exchange'] == exchange else Decimal(0))
-                           for r in active)
-                if used + addition > budget:
-                    return None  # Keep at least $50 of the virtual $100 untouched.
+            addition = virtual.number(item['spot_cost'], True) + virtual.number(item['future_notional'], True)
+            if virtual.used(db) + addition > virtual.deposit() / 2:
+                return None
+            for key in ('spot_fee', 'future_fee', 'multiplier'):
+                value = virtual.number(item[key], positive=(key == 'multiplier'))
+                if key != 'multiplier' and not Decimal(0) <= value < Decimal(1):
+                    return None
+            if parent_id is not None:
+                parent = db.execute("SELECT e.symbol,e.spot_exchange,e.futures_exchange FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE e.id=? AND v.state='open'", (parent_id,)).fetchone()
+                if not parent or (parent['symbol'], parent['spot_exchange'], parent['futures_exchange']) != (item['symbol'], item['spot'], item['future']):
+                    return None
         raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
         executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
         # Explicit allowlist: never persist API credentials or future private fields.
@@ -245,6 +256,8 @@ def record(item, path=None, at=None):
         db.executemany('''INSERT INTO checkpoints
             (episode_id, horizon_min, due_at, status) VALUES (?,?,?,?)''',
             [(episode_id, minute, now + minute * 60, 'pending') for minute in HORIZONS])
+        if budget is not None:
+            virtual.register(db, episode_id, item, parent_id)
         return episode_id
 
 
@@ -296,10 +309,16 @@ def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
         db.execute('''UPDATE episodes SET min_spread_pct=? WHERE id=?
                       AND CAST(min_spread_pct AS REAL)>?''',
                    (str(spread), episode['id'], float(spread)))
-        if (first < 0 and spread >= 0) or (first > 0 and spread <= CLOSED_PCT):
+        import virtual
+        virtual.ensure(db)
+        managed = db.execute('SELECT state FROM virtual_state WHERE episode_id=?', (episode['id'],)).fetchone()
+        if not managed and ((first < 0 and spread >= 0) or (first > 0 and spread <= CLOSED_PCT)):
             db.execute('''UPDATE episodes SET first_close_min=COALESCE(first_close_min,?),
                           status='closed' WHERE id=?''', (minute, episode['id']))
-    if minute == 60:
+    import virtual
+    virtual.ensure(db)
+    managed = db.execute('SELECT state FROM virtual_state WHERE episode_id=?', (episode['id'],)).fetchone()
+    if minute == 60 and not managed:
         pending = first_value(db.execute("SELECT COUNT(*) FROM checkpoints WHERE episode_id=? AND status!='observed'",
                                          (episode['id'],)).fetchone())
         if pending and not db.execute('SELECT first_close_min FROM episodes WHERE id=?',

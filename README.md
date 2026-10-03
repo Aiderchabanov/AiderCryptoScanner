@@ -199,3 +199,40 @@ from the same database. A missed one-minute observation window is marked
 limits apply; monitor usage and back up important history. The SQLite
 `PAPER_DB_PATH` option remains for local tests or a real persistent disk, never
 Render's ephemeral free filesystem. No API credentials are stored in episodes.
+
+## Persistent virtual lifecycle
+
+`virtual.py` adds only additive Neon tables (`virtual_state`, `virtual_proposals`,
+`virtual_events`, `virtual_meta`). Existing episodes and checkpoints remain.
+`PAPER_DEPOSIT_USDT` defaults to 500; aggregate used capital sums both Spot and
+Futures notionals and must stay <=250. This conservative accounting may permit
+fewer than five $50 pairs; no leverage or fictional margin reduction is assumed.
+
+Open positions continue after 60 minutes and after restart. Exit prices use Spot
+Bid / Futures Ask for the actual entry quantity, including executable depth and
+entry/exit fees. Positive entries close at observed spread <=0.10%; negative
+entries first have to converge to [0;0.10%], rather than closing immediately on
+entry. Funding receipts/payments after settlement are UNKNOWN until an actual
+settlement ledger is available: the displayed trading net excludes that unknown
+component and is explicitly not claimed as complete Net P&L.
+
+Telegram `/open` shows live P&L and selection buttons; `/close` creates a 60-second
+preview followed by a second confirmation. Confirmation fetches fresh prices
+again; >0.20 percentage point spread change or >0.20% price change requires a
+new preview. Only the configured private CHAT_ID owner can act; group operation
+requires `TELEGRAM_OPERATOR_ID`. Strong warnings at +5/+10/+15... pp offer a
+manually confirmed additional virtual entry; every entry repeats filters and
+shares the same capital cap. Spreads >5% require a second full evaluation that
+confirms the anomaly with actual depth. Missing data blocks action.
+
+A persistent update offset, one-use bound confirmation tokens, transaction locks
+and unique expansion keys prevent duplicate entries. The persistent notification
+outbox claims before sending (at-most-once): an ambiguous network failure is
+logged and is not retried automatically, because Telegram sendMessage has no
+idempotency key. All notification baselines and warning levels are retained.
+Manual closure cannot immediately reopen the same continuous gap.
+
+No exchange order, transfer or withdrawal endpoints are called. Isolated unit
+and restart tests use temporary SQLite files; synthetic episodes never enter
+Neon. Gate signature, Binance Retry-After and database connection settings stay
+unchanged.

@@ -204,11 +204,18 @@ def qualifies(item, now=None):
 
 
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
+    sampled_from = time.time()
     meta = futures_meta(api, future_exchange, symbol)
     buy_fee = api.fee(spot_exchange, symbol)
     perp_fee = futures_fee(api, future_exchange, symbol)
-    asks, _ = api.orderbook(spot_exchange, symbol)
-    _, bids = futures_book(api, future_exchange, symbol, meta['multiplier'])
+    spot_book = api.orderbook(spot_exchange, symbol)
+    future_book = futures_book(api, future_exchange, symbol, meta['multiplier'])
+    if getattr(api, 'multi_exchange', False):
+        import virtual
+        spot_book = virtual.checked_book(spot_book)
+        future_book = virtual.checked_book(future_book)
+    asks, _ = spot_book
+    _, bids = future_book
     if not asks or not bids:
         return None
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
@@ -248,7 +255,9 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     price_buffer = cost * PRICE_BUFFER_PCT / 100
     projected = spot_exit + short_proceeds - cover - cost - open_fee - close_fee - funding_debit - price_buffer
     pct = projected / cost * 100
-    return {'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
+    if time.time() - sampled_from > 30:
+        raise ValueError('Entry quotes expired')
+    return {'verified_at': sampled_from, 'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
             'category': category, 'raw_spread_pct': raw_spread,
             'executable_spread_pct': executable_spread,
             'quantity': quantity, 'spot_entry': cost / acquired,
@@ -324,6 +333,9 @@ def scan(api):
     for item in alerts:
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
+            if item.get('executable_spread_pct', 0) > 5 or item.get('raw_spread_pct', 0) > 5:
+                import virtual
+                item = virtual.verified_entry(api, {'symbol':item['symbol'], 'spot_exchange':item['spot'], 'futures_exchange':item['future']})
             # Recheck directly before creating an episode or sending Telegram.
             rate, next_at = fresh_funding(api, item['future'], item['symbol'])
             if rate <= 0:
@@ -354,7 +366,7 @@ def format_alert(x):
     executable = x.get('executable_spread_pct', (x['future_entry'] / x['spot_entry'] - 1) * 100)
     return (f"{title}\nМонета: {x['symbol']}\n"
             f"Spot: {x['spot']}; Futures: {x['future']}\n"
-            f"Размер: ${LEG_USDT:.0f}; резерв: ${RESERVE_USDT:.0f} на каждой бирже.\n"
+            f"Размер каждой ноги: до ${LEG_USDT:.0f}; общий лимит капитала: 50% виртуального депозита.\n"
             f"Spot Ask: {x.get('spot_ask', x['spot_entry']):.8g}; Futures Bid: {x.get('future_bid', x['future_entry']):.8g} USDT.\n"
             f"Исполнимые цены по стакану: Spot {x['spot_entry']:.8g}; Futures {x['future_entry']:.8g}.\n"
             f"Фактические объёмы: {x['spot_cost']:.2f} USDT спот; "

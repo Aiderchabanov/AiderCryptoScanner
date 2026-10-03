@@ -176,7 +176,7 @@ class BingXTests(unittest.TestCase):
              patch.object(api.bingx, 'fee', return_value=D('0.0005')), \
              patch.object(api.bingx, 'fresh_funding', return_value=(D('0.0001'), time.time()+18000)), \
              patch.object(api.bingx, 'orderbook', return_value=([['10.6', D('100')]], [['10.5', D('100')]])), \
-             patch.object(app, 'orderbook', return_value=([['10', '100']], [])), \
+             patch.object(app, 'orderbook', return_value=([['10', '100']], [['9.99','100']])), \
              patch.object(app, 'fee', return_value=D('0.001')), \
              patch.object(app, 'spot_rules', return_value={'min_qty': D('0.01'), 'min_quote': D('5'), 'step': D('0.01')}):
             item = basis.evaluate(api, 'ABCUSDT', 'Gate', 'BingX')
@@ -188,9 +188,11 @@ class BingXTests(unittest.TestCase):
             ident = paper.record(item, path)
             self.assertIsNotNone(ident)
             other = dict(item, symbol='XYZUSDT')
-            self.assertIsNone(paper.record(other, path))  # Already using half deposit.
+            self.assertIsNotNone(paper.record(other, path))  # Aggregate capital still below $250.
+            third = dict(item, symbol='THIRDUSDT')
+            self.assertIsNone(paper.record(third, path))  # Both legs would exceed $250.
             with paper.session(path) as db:
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 5)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 10)
                 self.assertNotIn('test-secret', db.execute('SELECT cost_snapshot_json FROM episodes').fetchone()[0])
         text = basis.format_alert(item)
         self.assertIn('PAPER / VIRTUAL ONLY', text)

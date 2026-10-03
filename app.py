@@ -156,11 +156,11 @@ def tickers():
              if x.get('currency_pair', '').endswith('_USDT')})
 
 
-def telegram(msg, chat_id=None):
+def telegram(msg, chat_id=None, reply_markup=None):
     if not TOKEN or not (chat_id or CHAT_ID):
         return
     response = requests.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-                             json={'chat_id': chat_id or CHAT_ID, 'text': msg}, timeout=10)
+                             json={'chat_id': chat_id or CHAT_ID, 'text': msg, **({'reply_markup':reply_markup} if reply_markup else {})}, timeout=10)
     if response.status_code != 200 or not response.json().get('ok'):
         raise RuntimeError(f'Telegram sendMessage HTTP {response.status_code}')
 
@@ -552,10 +552,17 @@ def basis_loop():
 
 
 def paper_loop():
+    import virtual
+    recovered = False
     while True:
         try:
             if paper.storage_ready():
+                if not recovered:
+                    virtual.bootstrap()
+                    recovered = True
                 paper.poll(current_scanner_api())
+                import virtual
+                virtual.observe(current_scanner_api())
         except Exception:
             logging.exception('Virtual checkpoints unavailable; no historical price substituted')
         time.sleep(min(SCAN, 20))
@@ -574,11 +581,14 @@ def home():
             'bingx_credentials_ready': current_scanner_api().bingx.credentials_ready,
             'basis_mode': 'read-only', 'basis_leg_usdt': float(basis.LEG_USDT),
             'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT),
-            'paper_storage_ready': paper.storage_ready()}
+            'paper_storage_ready': paper.storage_ready(),
+            'virtual_deposit_usdt': float(__import__('virtual').deposit()),
+            'virtual_capital_limit_usdt': float(__import__('virtual').deposit()/2)}
 
 
 def telegram_updates():
-    offset = 0
+    import virtual
+    offset = virtual.cursor()
     while True:
         try:
             response = requests.get(f'https://api.telegram.org/bot{TOKEN}/getUpdates',
@@ -591,6 +601,11 @@ def telegram_updates():
             if not payload.get('ok'):
                 raise RuntimeError('Telegram getUpdates failed')
             for update in payload.get('result', []):
+                offset = update['update_id'] + 1
+                if not virtual.claim_update(update['update_id']):
+                    continue
+                if virtual.handle(current_scanner_api(), update, CHAT_ID):
+                    continue
                 message = update.get('message', {})
                 chat_id = message.get('chat', {}).get('id')
                 command = message.get('text', '').split(maxsplit=1)
