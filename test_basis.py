@@ -117,7 +117,8 @@ class BasisTests(unittest.TestCase):
         api.dec = app.dec
         api.tickers.return_value = ({'ABCUSDT': {'askPrice': '10'}}, {})
         candidate = {'symbol': 'ABCUSDT', 'spot': 'Binance', 'future': 'Gate',
-                     'pct': D('0.8'), 'funding_filtered': False, 'funding': D('0.001')}
+                     'pct': D('0.8'), 'funding_filtered': False, 'funding': D('0.001'),
+                     'next_funding_at': time.time() + 1800}
         with patch.object(basis.paper, 'storage_ready', return_value=True), \
              patch.object(basis, 'futures_markets', return_value=({}, {'ABCUSDT': {'highest_bid': '10.3'}})), \
              patch.object(basis, 'evaluate', return_value=candidate), \
