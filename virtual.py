@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS virtual_meta (name TEXT PRIMARY KEY, value TEXT NOT N
 
 
 def ensure(db):
+    if getattr(db, 'is_postgres', False):
+        # Serialize additive DDL across scanner, observer and command threads.
+        db.execute("SELECT pg_advisory_xact_lock(hashtext('virtual-schema'))")
     for statement in SCHEMA.split(';'):
         if statement.strip():
             db.execute(statement)

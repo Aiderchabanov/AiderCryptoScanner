@@ -118,6 +118,12 @@ class VirtualTests(unittest.TestCase):
         self.assertIsNone(paper.record(self.item,self.path))
         self.assertIsNotNone(paper.record(self.item,self.path,parent_id=self.ident))
         self.assertIsNone(paper.record(self.item,self.path))
+    def test_postgres_schema_lock_precedes_ddl(self):
+        db=MagicMock(); db.is_postgres=True
+        virtual.ensure(db)
+        self.assertIn('virtual-schema', db.execute.call_args_list[0].args[0])
+        self.assertIn('CREATE TABLE', db.execute.call_args_list[1].args[0])
+
     def test_update_offset_restart_dedup(self):
         self.assertTrue(virtual.claim_update(42,self.path));self.assertFalse(virtual.claim_update(42,self.path));self.assertEqual(virtual.cursor(self.path),43)
     def test_checkpoints_do_not_release_managed_position_after_60m(self):

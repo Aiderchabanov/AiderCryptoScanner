@@ -588,9 +588,14 @@ def home():
 
 def telegram_updates():
     import virtual
-    offset = virtual.cursor()
+    offset = 0
+    ready_logged = False
     while True:
         try:
+            offset = max(offset, virtual.cursor())
+            if not ready_logged:
+                logging.info('Virtual Telegram /open /close callbacks ready; persistent offset %s', offset)
+                ready_logged = True
             response = requests.get(f'https://api.telegram.org/bot{TOKEN}/getUpdates',
                                     params={'timeout': 30, 'offset': offset}, timeout=35)
             if response.status_code != 200:
@@ -605,6 +610,12 @@ def telegram_updates():
                 if not virtual.claim_update(update['update_id']):
                     continue
                 if virtual.handle(current_scanner_api(), update, CHAT_ID):
+                    callback = update.get('callback_query', {})
+                    if callback.get('id'):
+                        try:
+                            requests.post(f'https://api.telegram.org/bot{TOKEN}/answerCallbackQuery', json={'callback_query_id':callback['id']}, timeout=10)
+                        except Exception:
+                            logging.warning('Virtual callback acknowledgment unavailable')
                     continue
                 message = update.get('message', {})
                 chat_id = message.get('chat', {}).get('id')

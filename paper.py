@@ -333,6 +333,8 @@ def finish_checkpoint(db, episode, minute, now, sample=None, reason=None):
 def poll(api, path=None, at=None):
     now = time.time() if at is None else at
     with session(path) as db:
+        import virtual
+        virtual.ensure(db)
         sql = '''SELECT e.*, c.horizon_min, c.due_at FROM checkpoints c
             JOIN episodes e ON e.id=c.episode_id
             WHERE c.status='pending' AND c.due_at<=? ORDER BY c.due_at LIMIT 30'''
