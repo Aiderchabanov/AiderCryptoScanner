@@ -50,6 +50,14 @@ class VirtualTests(unittest.TestCase):
         self.assertEqual(self.api.telegram.call_count,count)
         self.assertEqual(self.state()['last_warning'],2)
         self.assertEqual(len(virtual.rows(self.path)),1)
+    def test_strong_warning_becomes_latest_notification_baseline(self):
+        with paper.session(self.path) as db:
+            db.execute("UPDATE virtual_state SET last_notice_spread='6.7' WHERE episode_id=?",(self.ident,))
+        with patch.object(virtual,'quote',return_value=self.quote('7')):
+            virtual.observe(self.api,self.path)
+        self.assertEqual(self.state()['last_notice_spread'],'7')
+        self.assertEqual(self.api.telegram.call_count,1)
+
     def test_observe_close_and_capital_release_once(self):
         with patch.object(virtual,'quote',return_value=self.quote('.08')):
             virtual.observe(self.api,self.path);virtual.observe(self.api,self.path)

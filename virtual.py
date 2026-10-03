@@ -197,7 +197,7 @@ def observe(api, path=None):
                     buttons = [[{'text':'Рассмотреть дополнительный вход','callback_data':f"add:{e['episode_id']}:{step}"}]]
                     event(db,f"wide:{e['episode_id']}:{step}",e['episode_id'],f"🚨 VIRTUAL #{e['episode_id']} {e['symbol']}: расширение +{step*5} п.п. от входа\n{pnl_line(q)}\nАвтоусреднения нет. Можно рассмотреть дополнительный виртуальный вход.",buttons)
                 if level > current['last_warning']:
-                    db.execute('UPDATE virtual_state SET last_warning=? WHERE episode_id=?',(level,e['episode_id']))
+                    db.execute('UPDATE virtual_state SET last_warning=?,last_notice_spread=? WHERE episode_id=?',(level,str(spread),e['episode_id']))
         except Exception as exc:
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     dispatch(api,path)
@@ -227,7 +227,7 @@ def verified_entry(api,e):
     anomaly = D(item['executable_spread_pct']) > 5 or D(item['raw_spread_pct']) > 5
     if anomaly:
         repeated = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])
-        if not repeated or not api.basis.qualifies(repeated) or repeated['executable_spread_pct'] <= 5 or abs(repeated['executable_spread_pct']-item['executable_spread_pct']) > D('0.20'):
+        if not repeated or not api.basis.qualifies(repeated) or (repeated['executable_spread_pct'] <= 5 and repeated['raw_spread_pct'] <= 5) or abs(repeated['executable_spread_pct']-item['executable_spread_pct']) > D('0.20') or abs(repeated['raw_spread_pct']-item['raw_spread_pct']) > D('0.20'):
             raise ValueError('Anomalous spread not confirmed')
         item = repeated
         item['anomaly'] = 'ANOMALOUS_SPREAD_RECONFIRMED'
