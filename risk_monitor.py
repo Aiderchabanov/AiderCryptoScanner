@@ -191,7 +191,7 @@ class Monitor:
             except RuntimeError: raise HealthError('COOLDOWN_OR_API_UNAVAILABLE') from None
             except (ValueError,TypeError): raise HealthError('INVALID_RESPONSE') from None
 
-    def save(self,exchange,component,error=None,at=None):
+    def save(self,exchange,component,error=None,at=None,notifications=None):
         now=time.time() if at is None else at
         alert=None
         with paper.session(self.path) as db:
@@ -211,10 +211,7 @@ class Monitor:
                 if state=='CRITICAL' and not alerted:
                     # Durable at-most-once claim per incident, before Telegram.
                     alerted=1
-                    alert=(f"⚠️ Exchange Risk Alert\nБиржа: {exchange}\nПроблема: {component} API unavailable\n"
-                           f"HTTP/status: {status}\nПовторений: {failures}\n"
-                           f"Последний успешный ответ: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(last_ok)) if last_ok else 'ещё не подтверждён'}\n"
-                           "Торговый сканер не изменён. Реальные сделки не выполнялись.")
+                    alert={'exchange':exchange,'component':component,'status':status,'failures':failures,'last_ok':last_ok}
             db.execute('''INSERT INTO risk_checks (exchange,component,state,failures,last_ok,first_failure,last_check,status,alerted)
                           VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(exchange,component) DO UPDATE SET state=excluded.state,
                           failures=excluded.failures,last_ok=excluded.last_ok,first_failure=excluded.first_failure,
@@ -222,11 +219,43 @@ class Monitor:
                        (exchange,component,state,failures,last_ok,first,now,status,alerted))
         logging.info('Exchange Risk Monitor %s %s: %s status=%s repetitions=%s',exchange,component,state,status,failures)
         if alert:
-            try:self.api.telegram(alert)
-            except Exception:logging.warning('Exchange Risk notification delivery uncertain: %s %s',exchange,component)
+            if notifications is not None:notifications.append(alert)
+            else:self.notify([alert])
         return {'exchange':exchange,'component':component,'state':state,'status':status,'failures':failures}
 
+    def notify(self,notifications):
+        # Presentation only: claims, thresholds and incident resets stay per component.
+        groups={}
+        for row in notifications:
+            reason=row['status'].removeprefix('COOLDOWN ')
+            groups.setdefault((row['exchange'],reason),[]).append(row)
+        for (exchange,reason),rows in groups.items():
+            try:
+                deadlines=[]
+                with paper.session(self.path) as db:
+                    ensure(db)
+                    for row in rows:
+                        host=next((url.split('/')[2] for component,url,params,kind in ENDPOINTS[exchange] if component==row['component']),None)
+                        old=db.execute('SELECT * FROM risk_hosts WHERE host=?',(host,)).fetchone() if host else None
+                        if old and old['status'].removeprefix('COOLDOWN ')==reason and old['until_at']>time.time():
+                            deadlines.append((host,old['until_at']))
+                status='COOLDOWN '+reason if deadlines or any(r['status'].startswith('COOLDOWN ') for r in rows) else reason
+                successes=[r['last_ok'] for r in rows]
+                last_ok=time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(min(successes))) if all(t is not None for t in successes) else 'не подтверждён для всех перечисленных API'
+                until='; '.join(f"{host}: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(t))}" for host,t in sorted(set(deadlines))) if deadlines else 'не предоставлен / не известен'
+                text=(f"⚠️ Exchange Risk Alert\nБиржа: {exchange}\nСтатус: {status}\n\nНедоступно:\n"
+                      + '\n'.join('- '+r['component']+' API' for r in rows)
+                      + f"\n\nПовторений: {max(r['failures'] for r in rows)}\nПоследний успешный ответ: {last_ok}\nRetry-After / cooldown until: {until}\n"
+                      + "Торговый сканер не изменён. Реальные сделки не выполнялись.")
+                self.api.telegram(text)
+            except Exception:logging.warning('Exchange Risk notification delivery uncertain: %s',exchange)
+
     def once(self,exchange):
+        notifications=[]
+        try:return self.check_once(exchange,notifications)
+        finally:self.notify(notifications)
+
+    def check_once(self,exchange,notifications):
         results=[]
         for component,url,params,kind in ENDPOINTS[exchange]:
             error=None
@@ -241,7 +270,7 @@ class Monitor:
                         with self.bingx._lock:
                             self.bingx._blocked_until=max(self.bingx._blocked_until,time.monotonic()+exc.retry)
             except Exception: error=HealthError('TEMPORARY_DATA_UNAVAILABLE')
-            results.append(self.save(exchange,component,error))
+            results.append(self.save(exchange,component,error,notifications=notifications))
         if exchange=='BingX' and self.bingx and self.bingx.enabled and self.bingx.credentials_ready:
             for kind in ('spot_fee','futures_fee'):
                 error=None
@@ -255,7 +284,7 @@ class Monitor:
                     match=re.search(r'HTTP (\d+)',label)
                     error=HealthError('HTTP '+match.group(1) if match else 'READ_ONLY_KEY_UNAVAILABLE')
                 except Exception:error=HealthError('READ_ONLY_KEY_UNAVAILABLE')
-                results.append(self.save(exchange,'Read-only '+kind,error))
+                results.append(self.save(exchange,'Read-only '+kind,error,notifications=notifications))
         return results
 
     def loop(self,exchange):

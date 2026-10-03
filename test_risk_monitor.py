@@ -44,6 +44,43 @@ class RiskTests(unittest.TestCase):
         texts=[call.args[0] for call in self.api.telegram.call_args_list]
         self.assertEqual(len(texts),3)
         for exchange,text in zip(risk.EXCHANGES,texts):self.assertIn('Биржа: '+exchange,text)
+    def test_same_exchange_reason_cycle_one_alert_and_restart_no_duplicate(self):
+        self.monitor.block('api.binance.com',3600,'HTTP 418')
+        self.monitor.block('fapi.binance.com',3600,'HTTP 418')
+        with patch.object(self.monitor,'request',side_effect=risk.HealthError('COOLDOWN HTTP 418')):
+            for _ in range(3):self.monitor.once('Binance')
+        self.assertEqual(self.api.telegram.call_count,1)
+        text=self.api.telegram.call_args.args[0]
+        self.assertIn('Статус: COOLDOWN HTTP 418',text)
+        for component,*_ in risk.ENDPOINTS['Binance']:self.assertIn('- '+component+' API',text)
+        self.assertIn('Повторений: 3',text)
+        self.assertIn('api.binance.com:',text);self.assertIn('fapi.binance.com:',text)
+        restarted=risk.Monitor(self.api,self.path)
+        with patch.object(restarted,'request',side_effect=risk.HealthError('COOLDOWN HTTP 418')):restarted.once('Binance')
+        self.assertEqual(self.api.telegram.call_count,1)
+        self.api.scan_once.assert_not_called();self.api.basis.scan.assert_not_called()
+
+    def test_distinct_reasons_remain_separate_and_recovery_notifies_new_incident(self):
+        def request(exchange,url,params):
+            raise risk.HealthError('HTTP 503' if '/depth' in url else 'TIMEOUT')
+        with patch.object(self.monitor,'request',side_effect=request):
+            for _ in range(3):self.monitor.once('Binance')
+        self.assertEqual(self.api.telegram.call_count,2)
+        with patch.object(self.monitor,'request',return_value={}),patch.object(risk,'validate',return_value=True):self.monitor.once('Binance')
+        with patch.object(self.monitor,'request',side_effect=request):
+            for _ in range(3):self.monitor.once('Binance')
+        self.assertEqual(self.api.telegram.call_count,4)
+
+    def test_http_and_its_cooldown_group_without_changing_thresholds(self):
+        notices=[]
+        for component,status in [('Spot market','HTTP 418'),('Spot depth','COOLDOWN HTTP 418')]:
+            for at in (1,2,3):
+                row=self.monitor.save('Binance',component,risk.HealthError(status),at=at,notifications=notices)
+                self.assertEqual(row['state'],'CRITICAL' if at==3 else 'DEGRADED')
+        self.api.telegram.assert_not_called()
+        self.monitor.notify(notices)
+        self.assertEqual(self.api.telegram.call_count,1)
+
     def test_bingx_timeout_auth_5xx_rate_limit_classification_and_get_only(self):
         url=risk.ENDPOINTS['BingX'][0][1]
         with patch.object(risk.requests,'get',side_effect=requests.Timeout('secreturl')):
