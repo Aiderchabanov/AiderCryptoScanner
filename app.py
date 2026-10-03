@@ -536,6 +536,12 @@ def current_scanner_api():
 
 
 def basis_loop():
+    if current_scanner_api().bingx.enabled:
+        # One read-only probe shares the scanner's limiter; never records or alerts.
+        import smoke_bingx
+        report = smoke_bingx.probe(current_scanner_api().bingx)
+        logging.info('BingX GET-only startup probe: %s',
+                     {k: v.get('ok') for k, v in report.items() if isinstance(v, dict)})
     while True:
         try:
             results = basis.scan(current_scanner_api())

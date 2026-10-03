@@ -5,8 +5,8 @@ from decimal import Decimal
 import bingx
 
 
-def probe():
-    client = bingx.Client()
+def probe(client=None):
+    client = client if client is not None else bingx.Client()
     if not client.enabled:
         return {'mode': 'PAPER / VIRTUAL ONLY', 'error': 'Set BINGX_ENABLED=true'}
     report = {'mode': 'PAPER / VIRTUAL ONLY', 'observed_at': datetime.now(timezone.utc).isoformat(),
