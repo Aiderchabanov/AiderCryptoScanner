@@ -134,7 +134,10 @@ class VirtualTests(unittest.TestCase):
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,1)
         text=self.api.telegram.call_args.args[0]
-        self.assertIn('FUNDING ЧЕРЕЗ 30 МИНУТ',text)
+        self.assertIn('До funding осталось',text)
+        self.assertIn('Net P&L сейчас: недоступен',text)
+        self.assertIn('ожидаемый funding: +0.005050 USDT',text)
+        self.assertIn('Решение принимает пользователь',text)
         self.assertIn('Spot Ask: 10.01; Futures Bid: 10.1',text)
         self.assertIn('Funding: +0.0100%',text)
         self.assertIn('до $50',text)
@@ -148,6 +151,13 @@ class VirtualTests(unittest.TestCase):
         self.funding.return_value=(D('.0002'),deadline-1)
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,2) # Independent funding event key.
+
+    def test_funding_warning_net_pnl_and_percent(self):
+        self.funding.return_value=(D('.0001'),time.time()+1620)
+        virtual.funding_warnings(self.api,self.path)
+        text=self.api.telegram.call_args.args[0]
+        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.1968%',text)
+        self.assertIn('капитала обеих ног',text)
 
     def test_funding_warning_only_open_and_within_window(self):
         for deadline in (time.time()+1801,time.time()-1):

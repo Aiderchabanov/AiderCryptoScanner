@@ -223,7 +223,9 @@ def funding_snapshot(api, e):
     if spent is None or received is None or spent > 50 or received > 50 or time.monotonic()-started > 30:
         raise ValueError('Fresh $50 executable depth unavailable')
     spot, future = number(spent,True)/quantity,number(received,True)/quantity
-    return {'at':time.time(),'rate':str(rate),'next_at':next_at,
+    position_notional = api.sell_for_usdt(bids,number(e['quantity'],True))
+    expected = number(position_notional,True)*rate if position_notional is not None else None
+    return {'expected_funding':str(expected) if expected is not None else None, 'at':time.time(),'rate':str(rate),'next_at':next_at,
             'spot_ask':str(asks[0][0]),'future_bid':str(bids[0][0]),
             'spot_vwap':str(spot),'future_vwap':str(future),
             'raw_spread':str((bids[0][0]/asks[0][0]-1)*100),
@@ -238,19 +240,32 @@ def funding_warnings(api,path=None):
             if q is None:
                 continue
             key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
+            try:
+                pnl = quote(api,e)
+                if pnl['net_pnl'] is None:
+                    pnl_text = 'Net P&L сейчас: неизвестен; ' + pnl_line(pnl)
+                else:
+                    capital = number(e['used_capital'],True)
+                    net = number(pnl['net_pnl'])
+                    pnl_text = f'Net P&L сейчас: {net:+.4f} USDT ({net/capital*100:+.4f}% от капитала обеих ног)'
+            except Exception:
+                pnl_text = 'Net P&L сейчас: недоступен — свежие цены закрытия или комиссии не подтверждены'
             remaining = int(q['next_at']-time.time())
-            if not 0 < remaining <= 1800:
+            if not 0 < remaining <= 1800 or not 0 <= time.time()-q['at'] <= 30:
                 continue
-            body = (f"⚠️ FUNDING ЧЕРЕЗ 30 МИНУТ\nEpisode #{e['episode_id']}\n"
+            body = (f"⚠️ До funding осталось {remaining//60} мин {remaining%60} сек\nEpisode #{e['episode_id']}\n"
                     f"Монета: {e['symbol'][:-4]}/USDT\nSpot: {e['spot_exchange']}\nFutures: {e['futures_exchange']}\n"
                     f"Входной спред по стакану: {D(e['executable_spread_pct']):+.4f}%\n"
                     f"Текущий спред Ask/Bid: {D(q['raw_spread']):+.4f}%; по стакану: {D(q['spread']):+.4f}%\n"
                     f"Spot Ask: {q['spot_ask']}; Futures Bid: {q['future_bid']}\n"
                     f"Исполнимые цены по стакану до $50 на ногу: Spot {q['spot_vwap']}; Futures {q['future_vwap']}\n"
-                    f"Funding: {D(q['rate'])*100:+.4f}%\n"
+                    + pnl_text + '\n'
+                    + f"Funding: {D(q['rate'])*100:+.4f}%\n"
                     f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(q['next_at']))}\n"
                     f"Осталось: {remaining//60} мин {remaining%60} сек\n"
-                    "⏳ Виртуальная сделка всё ещё открыта.\n🟡 PAPER / VIRTUAL ONLY")
+                    + (f"Если оставить сделку открытой до funding, ожидаемый funding: {D(q['expected_funding']):+.6f} USDT\n" if q.get('expected_funding') is not None else "Ожидаемый funding: неизвестен\n")
+                    + "Оценка по текущему исполнимому Futures Bid и ставке; фактическое начисление зависит от mark price и ставки в момент funding.\n"
+                    "Решение принимает пользователь.\n⏳ Виртуальная сделка всё ещё открыта.\n🟡 PAPER / VIRTUAL ONLY")
             # Commit the unique claim BEFORE HTTP so restart cannot resend it.
             with paper.session(path) as db:
                 ensure(db);lock(db)
