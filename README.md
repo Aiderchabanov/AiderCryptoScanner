@@ -248,3 +248,25 @@ at-most-once, with a durable claim before HTTP; uncertain Telegram sends are
 not retried. Closing is serialized with reminder delivery. Missing live funding
 or executable depth blocks the reminder; stale snapshots are never sent.
 The original entry funding timestamp remains intact for P&L uncertainty.
+
+## Independent Exchange Risk Monitor
+
+Three separate threads check Binance, Gate and BingX public Spot market/depth,
+Futures market/depth and current funding APIs every 120 seconds (minimum 60).
+No scanner function is called. Public BingX checks run even when BingX trading
+signals are disabled, sharing its existing global pacing lock. If an enabled
+BingX read-only key is configured, only allowlisted GET fee endpoints are checked.
+
+Risk state, last successful responses, incident dedup and host cooldowns persist
+in additive `risk_checks` / `risk_hosts` Neon tables. Single failures are DEGRADED;
+three consecutive failed checks or five minutes of sustained unavailability are
+CRITICAL. Recovery resets the incident. Separate alerts identify each exchange
+and component. Timeout, 5xx, auth, rate-limit, malformed/missing or stale data
+remain distinct statuses. Retry-After seconds and HTTP dates are respected.
+The Binance GET helper and its existing bans are reused unchanged. Trading
+filters, order handling and virtual lifecycle are unchanged.
+
+Quote freshness is checked against snapshot timestamps when supplied (BingX
+depth requires one); endpoints without timestamps can only establish a fresh
+HTTP response, not prove the age of the exchange's underlying snapshot.
+Telegram delivery remains at-most-once; ambiguous sends are not retried.

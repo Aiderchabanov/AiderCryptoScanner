@@ -26,7 +26,9 @@ class ChangesTests(unittest.TestCase):
              patch('requests.get', side_effect=RuntimeError('offline')):
             runpy.run_path(str(Path(app.__file__)), run_name='__main__')
         targets = [c.kwargs['target'].__name__ for c in thread.call_args_list]
-        self.assertEqual(targets, ['basis_loop', 'paper_loop'])
+        self.assertEqual(targets, ['loop', 'loop', 'loop', 'basis_loop', 'paper_loop'])
+        self.assertEqual([c.kwargs.get('name') for c in thread.call_args_list[:3]], ['risk-Binance','risk-Gate','risk-BingX'])
+        self.assertTrue(all(c.kwargs['target'] is not app.loop for c in thread.call_args_list))
 
     def test_negative_executable_depth_and_funding_boundaries(self):
         now = 1000000000

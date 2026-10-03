@@ -660,6 +660,8 @@ if __name__ == '__main__':
         logging.warning('Virtual episode storage unavailable: Spot/Futures alerts paused')
     if SPOT_SPOT_ENABLED:
         threading.Thread(target=loop, daemon=True).start()
+    import risk_monitor
+    risk_monitor.Monitor(__import__(__name__), shared_bingx=current_scanner_api().bingx).start()
     threading.Thread(target=basis_loop, daemon=True).start()
     threading.Thread(target=paper_loop, daemon=True).start()
     if log_webhook_owner():
