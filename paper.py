@@ -215,7 +215,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         budget = item.get('paper_budget_usdt')
         if budget is not None:
             budget = Decimal(str(budget))
-            if not budget.is_finite() or budget != Decimal('50'):
+            if not budget.is_finite() or budget != __import__('basis').LEG_USDT:
                 return None
             addition = virtual.capital(item['spot_cost'],item['future_notional'])
             if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
@@ -239,7 +239,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
                         'price_buffer', 'multiplier', 'paper_budget_usdt')
         snapshot = {key: str(item[key]) for key in saved_fields if key in item}
         row = (item['symbol'], item['spot'], item['future'], 'spot_buy/futures_short',
-               now, '50', str(item['spot_cost']), str(item['future_notional']),
+               now, str(budget if budget is not None else item.get('paper_budget_usdt','50')), str(item['spot_cost']), str(item['future_notional']),
                str(item['quantity']), str(item['spot_ask']), str(item['spot_entry']),
                str(item['future_bid']), str(item['future_entry']), str(raw),
                str(executable), str(item['pct']), str(item['funding']),

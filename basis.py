@@ -7,7 +7,8 @@ from decimal import Decimal, ROUND_DOWN
 import paper
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
-LEG_USDT = Decimal('50')
+TARGET_LEG_USDT = Decimal('30')
+LEG_USDT = TARGET_LEG_USDT
 RESERVE_USDT = Decimal('50')
 EXIT_SLIPPAGE = Decimal(os.getenv('BASIS_EXIT_SLIPPAGE_PCT', '0.30')) / 100
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
@@ -79,9 +80,11 @@ def futures_meta(api, exchange, symbol):
     lot = filters.get('MARKET_LOT_SIZE') or filters.get('LOT_SIZE')
     if not lot or api.dec(lot.get('stepSize')) == 0:
         lot = filters.get('LOT_SIZE')
-    notional = filters.get('MIN_NOTIONAL', {})
+    notional = filters.get('MIN_NOTIONAL') or filters.get('NOTIONAL')
+    if not lot or not notional:
+        raise ValueError('Futures minimum order filters unavailable')
     return {'step': api.dec(lot['stepSize']), 'min_qty': api.dec(lot['minQty']),
-            'min_notional': api.dec(notional.get('notional') or notional.get('minNotional') or 0),
+            'min_notional': api.dec(notional.get('notional') if notional.get('notional') is not None else notional.get('minNotional')),
             'multiplier': Decimal(1), 'funding': None}
 
 
@@ -227,17 +230,28 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
     if not spot_ask or not perp_bid or spot_ask <= 0 or perp_bid <= 0:
         return None
+    rules = api.spot_rules(spot_exchange, symbol, 'buy')
+    # Step expresses allowed quantity precision; Futures size is rounded down by it.
+    required=[meta.get('min_qty'),meta.get('step'),meta.get('min_notional'),rules.get('min_qty'),rules.get('min_quote'),rules.get('step')] if rules else []
+    if len(required)!=6 or any(v is None or not Decimal(str(v)).is_finite() or Decimal(str(v))<0 for v in required) or meta['step']<=0 or rules['step']<=0:
+        raise ValueError('Mandatory minimum order / quantity precision unavailable')
+    if rules['min_quote']>LEG_USDT or meta['min_notional']>LEG_USDT or meta['min_qty']*perp_bid>LEG_USDT or rules['min_qty']*spot_ask>LEG_USDT:
+        logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; required exchange minimum exceeds target',symbol,spot_exchange,future_exchange,LEG_USDT)
+        return None
     quantity = down(min(LEG_USDT * (1 - buy_fee) / spot_ask,
                         LEG_USDT / perp_bid), meta['step'])
     if quantity <= 0 or quantity < meta['min_qty']:
+        logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; Futures minQty/stepSize',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
     acquired = quantity / (1 - buy_fee)
     cost = spot_cost(asks, acquired, api)
     short_proceeds = api.sell_for_usdt(bids, quantity)
     if cost is None or short_proceeds is None or cost > LEG_USDT or short_proceeds > LEG_USDT:
         return None
-    rules = api.spot_rules(spot_exchange, symbol, 'buy')
-    if not api.order_size_ok(rules, acquired, cost) or short_proceeds < meta['min_notional']:
+    if acquired < rules['min_qty'] or cost < rules['min_quote'] or short_proceeds < meta['min_notional']:
+        logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; minimum size/notional fails at executable prices',symbol,spot_exchange,future_exchange,LEG_USDT)
+        return None
+    if not api.order_size_ok(rules, acquired, cost):
         return None
     if cost < LEG_USDT * Decimal('0.8') or short_proceeds < LEG_USDT * Decimal('0.8'):
         return None

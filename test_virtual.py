@@ -17,6 +17,7 @@ class VirtualTests(unittest.TestCase):
         self.api.orderbook.return_value=([['10.01','100']], [['10','100']])
         self.future=patch.object(basis,'futures_book',return_value=([['10.11','100']],[['10.1','100']])).start()
         self.addCleanup(patch.stopall)
+        patch.object(basis,'LEG_USDT',D(50)).start() # Historical $50 episodes remain supported.
         patch.object(basis,'futures_fee',return_value=D('.001')).start()
         self.funding=patch.object(basis,'fresh_funding',return_value=(D('.0001'),time.time()+18000)).start()
         self.api.fee.return_value=D('.001')

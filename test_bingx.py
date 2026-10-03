@@ -190,9 +190,9 @@ class BingXTests(unittest.TestCase):
             other = dict(item, symbol='XYZUSDT')
             self.assertIsNotNone(paper.record(other, path))  # Aggregate capital still below $250.
             third = dict(item, symbol='THIRDUSDT')
-            self.assertIsNone(paper.record(third, path))  # Spot capital plus 1x Futures margin exceeds $250.
+            self.assertIsNotNone(paper.record(third, path))  # Three new $30 pairs fit within $250.
             with paper.session(path) as db:
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 18)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0], 27)
                 self.assertNotIn('test-secret', db.execute('SELECT cost_snapshot_json FROM episodes').fetchone()[0])
         text = basis.format_alert(item)
         self.assertIn('PAPER / VIRTUAL ONLY', text)

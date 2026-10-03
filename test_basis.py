@@ -79,10 +79,10 @@ class BasisTests(unittest.TestCase):
              patch.object(app, 'gate', return_value={'funding_rate': '-0.001',
                                                      'funding_next_apply': time.time() + 1800}):
             result = basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate', '-0.001')
-        self.assertEqual(result['quantity'], D('4.8'))
+        self.assertEqual(result['quantity'], D('2.9'))
         self.assertGreater(result['projected'], 0)
         self.assertLess(result['projected'], D('1.5'))
-        self.assertEqual(result['funding_debit'], D('0.04944'))
+        self.assertEqual(result['funding_debit'], D('0.02987'))
         self.assertTrue(result['funding_filtered'])
 
     def test_funding_before_and_after_settlement_for_short(self):
@@ -171,7 +171,7 @@ class BasisTests(unittest.TestCase):
                 basis.futures_fee(app, 'Gate', 'ABCUSDT')
 
     def test_read_only_and_budget_status(self):
-        self.assertEqual(app.app.test_client().get('/').json['basis_leg_usdt'], 50.0)
+        self.assertEqual(app.app.test_client().get('/').json['basis_leg_usdt'], 30.0)
         self.assertEqual(app.app.test_client().get('/').json['basis_mode'], 'read-only')
         with patch.object(app, 'BINANCE_KEY', ''), patch.object(app, 'tickers') as tickers:
             self.assertEqual(basis.scan(app), [])
