@@ -200,7 +200,79 @@ def observe(api, path=None):
                     db.execute('UPDATE virtual_state SET last_warning=?,last_notice_spread=? WHERE episode_id=?',(level,str(spread),e['episode_id']))
         except Exception as exc:
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
+    funding_warnings(api,path)
     dispatch(api,path)
+
+
+def funding_snapshot(api, e):
+    """Fresh schedule and entry-side executable quotes for up to $50 per leg."""
+    started = time.monotonic()
+    rate, next_at = api.basis.fresh_funding(api,e['futures_exchange'],e['symbol'])
+    rate = number(rate)
+    if not math.isfinite(next_at) or next_at <= time.time():
+        raise ValueError('Next funding unavailable')
+    remaining = next_at-time.time()
+    if not 0 < remaining <= 1800:
+        return None
+    original = json.loads(e['cost_snapshot_json'])
+    asks,_ = checked_book(api.orderbook(e['spot_exchange'],e['symbol']))
+    _,bids = checked_book(api.basis.futures_book(api,e['futures_exchange'],e['symbol'],number(original['multiplier'],True)))
+    quantity = min(D(50)/asks[0][0],D(50)/bids[0][0])
+    spent = api.basis.spot_cost(asks,quantity,api)
+    received = api.sell_for_usdt(bids,quantity)
+    if spent is None or received is None or spent > 50 or received > 50 or time.monotonic()-started > 30:
+        raise ValueError('Fresh $50 executable depth unavailable')
+    spot, future = number(spent,True)/quantity,number(received,True)/quantity
+    return {'at':time.time(),'rate':str(rate),'next_at':next_at,
+            'spot_ask':str(asks[0][0]),'future_bid':str(bids[0][0]),
+            'spot_vwap':str(spot),'future_vwap':str(future),
+            'raw_spread':str((bids[0][0]/asks[0][0]-1)*100),
+            'spread':str((future/spot-1)*100)}
+
+
+def funding_warnings(api,path=None):
+    for e in rows(path):
+        try:
+            # Schedule is refreshed independently of exit P&L/fee availability.
+            q = funding_snapshot(api,e)
+            if q is None:
+                continue
+            key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
+            remaining = int(q['next_at']-time.time())
+            if not 0 < remaining <= 1800:
+                continue
+            body = (f"⚠️ FUNDING ЧЕРЕЗ 30 МИНУТ\nEpisode #{e['episode_id']}\n"
+                    f"Монета: {e['symbol'][:-4]}/USDT\nSpot: {e['spot_exchange']}\nFutures: {e['futures_exchange']}\n"
+                    f"Входной спред по стакану: {D(e['executable_spread_pct']):+.4f}%\n"
+                    f"Текущий спред Ask/Bid: {D(q['raw_spread']):+.4f}%; по стакану: {D(q['spread']):+.4f}%\n"
+                    f"Spot Ask: {q['spot_ask']}; Futures Bid: {q['future_bid']}\n"
+                    f"Исполнимые цены по стакану до $50 на ногу: Spot {q['spot_vwap']}; Futures {q['future_vwap']}\n"
+                    f"Funding: {D(q['rate'])*100:+.4f}%\n"
+                    f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(q['next_at']))}\n"
+                    f"Осталось: {remaining//60} мин {remaining%60} сек\n"
+                    "⏳ Виртуальная сделка всё ещё открыта.\n🟡 PAPER / VIRTUAL ONLY")
+            # Commit the unique claim BEFORE HTTP so restart cannot resend it.
+            with paper.session(path) as db:
+                ensure(db);lock(db)
+                current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(e['episode_id'],)).fetchone()
+                if not current or current['state']!='open':
+                    continue
+                result=db.execute("INSERT INTO virtual_events (event_key,episode_id,body,state) VALUES (?,?,?,'claimed') ON CONFLICT (event_key) DO NOTHING",(key,e['episode_id'],body))
+                if result.rowcount!=1:
+                    continue
+            with paper.session(path) as db:
+                ensure(db);lock(db)
+                current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(e['episode_id'],)).fetchone()
+                # Lock spans Telegram HTTP: a concurrent close cannot race this send.
+                if not current or current['state']!='open' or not 0 <= time.time()-q['at'] <= 30 or not 0 < q['next_at']-time.time() <= 1800:
+                    db.execute("UPDATE virtual_events SET state='cancelled' WHERE event_key=?",(key,))
+                    continue
+                api.telegram(body)
+                db.execute("UPDATE virtual_events SET state='sent' WHERE event_key=?",(key,))
+                db.execute('UPDATE virtual_state SET last_notice_spread=? WHERE episode_id=?',(q['spread'],e['episode_id']))
+            logging.info('Virtual funding warning sent: episode #%s, funding event %s',e['episode_id'],int(q['next_at']))
+        except Exception as exc:
+            logging.warning('Virtual funding warning #%s unavailable or delivery uncertain (%s)',e['episode_id'],type(exc).__name__)
 
 
 def dispatch(api,path=None):

@@ -18,6 +18,7 @@ class VirtualTests(unittest.TestCase):
         self.future=patch.object(basis,'futures_book',return_value=([['10.11','100']],[['10.1','100']])).start()
         self.addCleanup(patch.stopall)
         patch.object(basis,'futures_fee',return_value=D('.001')).start()
+        self.funding=patch.object(basis,'fresh_funding',return_value=(D('.0001'),time.time()+18000)).start()
         self.api.fee.return_value=D('.001')
         item=example();item['paper_budget_usdt']=D(50);item['next_funding_at']=time.time()+18000
         item['raw_spread_pct']=D(2);item['executable_spread_pct']=D('1.8')
@@ -126,6 +127,65 @@ class VirtualTests(unittest.TestCase):
         self.assertIsNone(paper.record(self.item,self.path))
         self.assertIsNotNone(paper.record(self.item,self.path,parent_id=self.ident))
         self.assertIsNone(paper.record(self.item,self.path))
+    def test_funding_warning_fresh_books_once_and_restart(self):
+        deadline=time.time()+1800
+        self.funding.return_value=(D('.0001'),deadline)
+        self.api.fee.return_value=None # Exit P&L costs do not suppress the funding reminder.
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,1)
+        text=self.api.telegram.call_args.args[0]
+        self.assertIn('FUNDING ЧЕРЕЗ 30 МИНУТ',text)
+        self.assertIn('Spot Ask: 10.01; Futures Bid: 10.1',text)
+        self.assertIn('Funding: +0.0100%',text)
+        self.assertIn('до $50',text)
+        virtual.bootstrap(self.path)
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,1)
+        self.assertEqual(self.state()['state'],'open')
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_events WHERE state='sent'").fetchone()[0],1)
+            self.assertEqual(db.execute('SELECT next_funding_at FROM episodes').fetchone()[0],self.item['next_funding_at'])
+        self.funding.return_value=(D('.0002'),deadline-1)
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,2) # Independent funding event key.
+
+    def test_funding_warning_only_open_and_within_window(self):
+        for deadline in (time.time()+1801,time.time()-1):
+            self.funding.return_value=(D('.001'),deadline)
+            virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,0)
+        with paper.session(self.path) as db:db.execute("UPDATE virtual_state SET state='closed'")
+        self.funding.return_value=(D('.001'),time.time()+1500)
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,0)
+
+    def test_funding_unknown_or_no_fresh_depth_never_notifies(self):
+        self.funding.return_value=(None,time.time()+1700)
+        virtual.funding_warnings(self.api,self.path)
+        self.funding.return_value=(D('.001'),time.time()+1700)
+        self.api.orderbook.return_value=([['10.01','1']],[['10','1']])
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,0)
+        with paper.session(self.path) as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_events').fetchone()[0],0)
+
+    def test_funding_warning_close_race_skips_send(self):
+        q={'at':time.time(),'next_at':time.time()+1200,'rate':'.0001','spot_ask':'10','future_bid':'10.1','spot_vwap':'10','future_vwap':'10.1','raw_spread':'1','spread':'1'}
+        def close_during_fetch(*args):
+            with paper.session(self.path) as db:db.execute("UPDATE virtual_state SET state='closed'")
+            return q
+        with patch.object(virtual,'funding_snapshot',side_effect=close_during_fetch):
+            virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,0)
+
+    def test_funding_ambiguous_send_is_not_repeated_after_restart(self):
+        self.funding.return_value=(D('.001'),time.time()+1500)
+        self.api.telegram.side_effect=RuntimeError('network timeout')
+        virtual.funding_warnings(self.api,self.path)
+        virtual.bootstrap(self.path)
+        virtual.funding_warnings(self.api,self.path)
+        self.assertEqual(self.api.telegram.call_count,1)
+        with paper.session(self.path) as db:self.assertEqual(db.execute('SELECT state FROM virtual_events').fetchone()[0],'claimed')
+
     def test_postgres_schema_lock_precedes_ddl(self):
         db=MagicMock(); db.is_postgres=True
         virtual.ensure(db)

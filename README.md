@@ -236,3 +236,15 @@ No exchange order, transfer or withdrawal endpoints are called. Isolated unit
 and restart tests use temporary SQLite files; synthetic episodes never enter
 Neon. Gate signature, Binance Retry-After and database connection settings stay
 unchanged.
+
+### Funding reminder
+
+Every open episode refreshes its actual next funding schedule. On the first
+valid observation within 30 minutes before that event, a separate reminder
+uses fresh Spot Ask / Futures Bid and executable depth up to $50 per leg.
+It displays the actual remaining time in UTC and does not close or add entries.
+The episode/event timestamp is a unique persistent outbox key. Delivery is
+at-most-once, with a durable claim before HTTP; uncertain Telegram sends are
+not retried. Closing is serialized with reminder delivery. Missing live funding
+or executable depth blocks the reminder; stale snapshots are never sent.
+The original entry funding timestamp remains intact for P&L uncertainty.
