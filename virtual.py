@@ -235,11 +235,11 @@ def close_db(db, e, q):
     result = db.execute("UPDATE virtual_state SET state='closed',closed_at=?,close_json=?,current_json=? WHERE episode_id=? AND state='open'",(q['at'],json.dumps(q),json.dumps(q),e['episode_id']))
     if result.rowcount != 1:
         return False
-    entry=number(e['executable_spread_pct']);spread=number(q['spread'])
-    converged=spread<=paper.CLOSED_PCT if entry>0 else D(0)<=spread<=paper.CLOSED_PCT
+    spread=number(q['spread'])
+    converged=abs(spread)<=paper.CLOSED_PCT
     update_metrics(db,e,q,converged)
     db.execute("UPDATE episodes SET status='closed', first_close_min=COALESCE(first_close_min,?) WHERE id=?",(max(1,math.ceil((q['at']-e['started_at'])/60)), e['episode_id']))
-    if D(q['spread']) <= paper.CLOSED_PCT and (D(e['executable_spread_pct']) > 0 or D(q['spread']) >= 0):
+    if abs(D(q['spread'])) <= paper.CLOSED_PCT:
         db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"gapreset:{e['episode_id']}",'1'))
     event(db, f"close:{e['episode_id']}",e['episode_id'], f"✅ VIRTUAL CLOSED #{e['episode_id']} {e['symbol']}\nSpot SELL {q['spot_exit']}; Futures BUY {q['future_exit']}\n{pnl_line(q)}\nPAPER ONLY")
     return True
@@ -253,7 +253,7 @@ def observe(api, path=None):
     for e in waiting:
         try:
             q = quote(api,e)
-            if D(q['spread']) <= paper.CLOSED_PCT and (D(e['executable_spread_pct']) > 0 or D(q['spread']) >= 0):
+            if abs(D(q['spread'])) <= paper.CLOSED_PCT:
                 with paper.session(path) as db:
                     db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"gapreset:{e['episode_id']}",'1'))
         except Exception:
@@ -268,10 +268,9 @@ def observe(api, path=None):
                     continue
                 db.execute('UPDATE virtual_state SET current_json=?,sampled_at=? WHERE episode_id=?',(json.dumps(q),q['at'],e['episode_id']))
                 spread = D(q['spread'])
-                # Negative entries must first observe convergence towards zero;
-                # entering at -1% is not already a closed trade.
+                # Convergence is the same +/-0.10% band for every entry sign.
                 entry = D(e['executable_spread_pct'])
-                converged = spread <= paper.CLOSED_PCT if entry > 0 else D(0) <= spread <= paper.CLOSED_PCT
+                converged = abs(spread) <= paper.CLOSED_PCT
                 update_metrics(db,e,q,converged)
                 if converged:
                     close_db(db,e,q)

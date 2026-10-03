@@ -66,6 +66,21 @@ class VirtualTests(unittest.TestCase):
         self.assertEqual(self.state()['state'],'closed');self.assertEqual(self.api.telegram.call_count,1)
         with paper.session(self.path) as db:self.assertEqual(virtual.used(db),0)
         self.assertIsNotNone(paper.record(self.item,self.path))
+    def test_auto_close_symmetric_band_all_entry_signs(self):
+        for entry in ('1', '-1', '0'):
+            for spread, expected in (('.08','closed'), ('-.08','closed'), ('.11','open'), ('-.11','open'), ('.10','closed'), ('-.10','closed')):
+                with self.subTest(entry=entry, spread=spread):
+                    with paper.session(self.path) as db:
+                        db.execute('UPDATE episodes SET executable_spread_pct=? WHERE id=?',(entry,self.ident))
+                        db.execute("UPDATE virtual_state SET state='open' WHERE episode_id=?",(self.ident,))
+                        db.execute('UPDATE virtual_metrics SET convergence_seconds=NULL WHERE episode_id=?',(self.ident,))
+                    with patch.object(virtual,'quote',return_value=self.quote(spread)):
+                        virtual.observe(self.api,self.path)
+                    self.assertEqual(self.state()['state'],expected)
+                    with paper.session(self.path) as db:
+                        m=db.execute('SELECT convergence_seconds FROM virtual_metrics WHERE episode_id=?',(self.ident,)).fetchone()
+                        self.assertEqual(m['convergence_seconds'] is not None,expected=='closed')
+
     def test_negative_entry_not_closed_until_zero(self):
         with paper.session(self.path) as db:
             db.execute("UPDATE episodes SET executable_spread_pct='-1' WHERE id=?",(self.ident,))
