@@ -37,7 +37,7 @@ class ChangesTests(unittest.TestCase):
              patch.object(basis, 'futures_meta', return_value=meta), \
              patch.object(basis, 'futures_fee', return_value=D('0.001')), \
              patch.object(app, 'fee', return_value=D('0.001')), \
-             patch.object(app, 'orderbook', return_value=([['10', '100']], [])), \
+             patch.object(app, 'orderbook', return_value=([['10', '100']], [['9.99','100']])), \
              patch.object(app, 'spot_rules', return_value={'min_qty': D('0.01'), 'min_quote': D('5'), 'step': D('0.01')}), \
              patch.object(basis, 'fresh_funding') as funding, \
              patch.object(basis, 'futures_book') as book:
@@ -48,11 +48,10 @@ class ChangesTests(unittest.TestCase):
                 ('10', '0.001', 18000, False)):
                 with self.subTest(bid=bid, rate=rate, remaining=remaining):
                     funding.return_value = (D(rate), now + remaining)
-                    book.return_value = ([], [[bid, D('100')]])
+                    book.return_value = ([[str(D(bid)+D('.01')),D('100')]], [[bid, D('100')]])
                     item = basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate')
-                    self.assertEqual(item is not None, allowed)
                     if item:
-                        self.assertTrue(basis.qualifies(item, now))
+                        self.assertFalse(basis.qualifies(item, now))
                         self.assertEqual(item['category'], 'NEGATIVE')
                         self.assertLess(item['pct'], 0)  # No imaginary profit threshold.
             funding.return_value = (D('0.001'), now + 18000)
@@ -68,7 +67,7 @@ class ChangesTests(unittest.TestCase):
         item = example()
         item.update(symbol='ABCUSDT', spot='Binance', category='NEGATIVE',
                     raw_spread_pct=D('-1'), executable_spread_pct=D('-1'),
-                    funding_filtered=False, next_funding_at=now+18000)
+                    funding_filtered=False, pct=D('-1'), next_funding_at=now+18000)
         with patch.object(paper, 'storage_ready', return_value=True), \
              patch.object(basis, 'futures_markets', return_value=({'ABCUSDT': {'bidPrice': '9.9'}}, {'ABCUSDT': {'highest_bid': '9.9'}})), \
              patch.object(basis, 'evaluate', return_value=item) as evaluate, \

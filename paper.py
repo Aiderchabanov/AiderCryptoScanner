@@ -170,6 +170,13 @@ def save_api_backoff(host, until_at):
 def record(item, path=None, at=None, parent_id=None, connection=None):
     """Create one episode for a qualified alert; return its ID or None."""
     now = time.time() if at is None else at
+    import entry_policy
+    item=dict(item)
+    item['entry_policy']=entry_policy.VERSION
+    rejection=entry_policy.reason(item,now)
+    if rejection:
+        entry_policy.reject(rejection,item,path,connection)
+        return None
     try:
         rate = Decimal(str(item['funding']))
         next_at = float(item['next_funding_at'])
@@ -219,6 +226,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
                 return None
             addition = virtual.capital(item['spot_cost'],item['future_notional'])
             if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
+                entry_policy.reject('REJECTED_MAX_DEPOSIT_LOAD',item,path,db)
                 return None
             for key in ('spot_fee', 'future_fee', 'multiplier'):
                 value = virtual.number(item[key], positive=(key == 'multiplier'))
@@ -236,7 +244,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
                         'future_entry', 'pct', 'funding', 'next_funding_at',
                         'funding_debit', 'spot_fee', 'future_fee',
                         'spot_slippage_usdt', 'futures_slippage_usdt',
-                        'price_buffer', 'multiplier', 'paper_budget_usdt')
+                        'price_buffer', 'multiplier', 'paper_budget_usdt', 'entry_policy')
         snapshot = {key: str(item[key]) for key in saved_fields if key in item}
         row = (item['symbol'], item['spot'], item['future'], 'spot_buy/futures_short',
                now, str(budget if budget is not None else item.get('paper_budget_usdt','50')), str(item['spot_cost']), str(item['future_notional']),

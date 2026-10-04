@@ -73,8 +73,8 @@ class BasisTests(unittest.TestCase):
         with patch.object(basis, 'futures_meta', return_value=metadata), \
              patch.object(basis, 'futures_fee', return_value=D('0.001')), \
              patch.object(app, 'fee', return_value=D('0.001')), \
-             patch.object(app, 'orderbook', return_value=([['10', '100']], [])), \
-             patch.object(basis, 'futures_book', return_value=([], [['10.3', D('100')]])), \
+             patch.object(app, 'orderbook', return_value=([['10', '100']], [['9.99','100']])), \
+             patch.object(basis, 'futures_book', return_value=([['10.31',D('100')]], [['10.3', D('100')]])), \
              patch.object(app, 'spot_rules', return_value={'min_qty': D('0.1'), 'min_quote': D('5'), 'step': D('0.01')}), \
              patch.object(app, 'gate', return_value={'funding_rate': '-0.001',
                                                      'funding_next_apply': time.time() + 1800}):
@@ -91,8 +91,8 @@ class BasisTests(unittest.TestCase):
         with patch.object(basis, 'futures_meta', return_value=metadata), \
              patch.object(basis, 'futures_fee', return_value=D('0.001')), \
              patch.object(app, 'fee', return_value=D('0.001')), \
-             patch.object(app, 'orderbook', return_value=([['10', '100']], [])), \
-             patch.object(basis, 'futures_book', return_value=([], [['10.3', D('100')]])), \
+             patch.object(app, 'orderbook', return_value=([['10', '100']], [['9.99','100']])), \
+             patch.object(basis, 'futures_book', return_value=([['10.31',D('100')]], [['10.3', D('100')]])), \
              patch.object(app, 'spot_rules', return_value={'min_qty': D('0.1'), 'min_quote': D('5'), 'step': D('0.01')}), \
              patch.object(app, 'gate') as gate:
             gate.return_value = {'funding_rate': '-0.001', 'funding_next_apply': time.time() + 7200}
@@ -163,7 +163,7 @@ class BasisTests(unittest.TestCase):
              patch.object(basis, 'futures_fee', return_value=D('0.001')), \
              patch.object(app, 'fee', return_value=D('0.001')), \
              patch.object(app, 'orderbook', return_value=([['10', '1']], [])), \
-             patch.object(basis, 'futures_book', return_value=([], [['10.3', D('100')]])):
+             patch.object(basis, 'futures_book', return_value=([['10.31',D('100')]], [['10.3', D('100')]])):
             self.assertIsNone(basis.evaluate(app, 'ABCUSDT', 'Binance', 'Gate', '0'))
         with patch.object(app, 'gate', return_value={}), \
              patch.object(app, 'cached', side_effect=lambda _, __, load: load()):

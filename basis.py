@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
 import paper
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
@@ -12,7 +12,7 @@ LEG_USDT = TARGET_LEG_USDT
 RESERVE_USDT = Decimal('50')
 EXIT_SLIPPAGE = Decimal(os.getenv('BASIS_EXIT_SLIPPAGE_PCT', '0.30')) / 100
 MAX_BASIS_CANDIDATES = int(os.getenv('BASIS_MAX_CANDIDATES', '8'))
-MIN_BASIS_NET = max(Decimal('0.5'), Decimal(os.getenv('BASIS_MIN_CONVERGENCE_PCT', '0.5')))
+MIN_BASIS_NET = Decimal('0.20')
 PRICE_BUFFER_PCT = Decimal('0.20')
 last_alert = {}
 api_blocked_until = {}
@@ -201,17 +201,8 @@ def spread_category(raw, executable):
 
 
 def qualifies(item, now=None):
-    now = time.time() if now is None else now
-    if item['funding'] <= 0 or item['next_funding_at'] <= now:
-        return False
-    category = item.get('category', 'POSITIVE')
-    if 'BingX' in (item.get('spot'), item.get('future')) and item['pct'] < MIN_BASIS_NET:
-        return False
-    if category == 'NEGATIVE':
-        return (Decimal('-2') <= item['raw_spread_pct'] < 0
-                and Decimal('-2') <= item['executable_spread_pct'] < 0
-                and item['next_funding_at'] - now >= 4 * 3600)
-    return category == 'POSITIVE' and item['pct'] >= MIN_BASIS_NET
+    import entry_policy
+    return entry_policy.reason(item,now) is None
 
 
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
@@ -225,8 +216,8 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
         import virtual
         spot_book = virtual.checked_book(spot_book)
         future_book = virtual.checked_book(future_book)
-    asks, _ = spot_book
-    _, bids = future_book
+    asks, spot_bids = spot_book
+    future_asks, bids = future_book
     if not asks or not bids:
         return None
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
@@ -238,19 +229,25 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     if len(required)!=6 or any(v is None or not Decimal(str(v)).is_finite() or Decimal(str(v))<0 for v in required) or meta['step']<=0 or rules['step']<=0:
         raise ValueError('Mandatory minimum order / quantity precision unavailable')
     if rules['min_quote']>LEG_USDT or meta['min_notional']>LEG_USDT or meta['min_qty']*perp_bid>LEG_USDT or rules['min_qty']*spot_ask>LEG_USDT:
+        import entry_policy
+        entry_policy.reject('REJECTED_MIN_ORDER_ABOVE_TARGET',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
         logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; required exchange minimum exceeds target',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
     quantity = down(min(LEG_USDT * (1 - buy_fee) / spot_ask,
                         LEG_USDT / perp_bid), meta['step'])
     if quantity <= 0 or quantity < meta['min_qty']:
+        import entry_policy
+        entry_policy.reject('REJECTED_MIN_ORDER_ABOVE_TARGET',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
         logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; Futures minQty/stepSize',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
-    acquired = quantity / (1 - buy_fee)
+    acquired = (quantity / (1 - buy_fee) / rules['step']).to_integral_value(rounding=ROUND_CEILING) * rules['step']
     cost = spot_cost(asks, acquired, api)
     short_proceeds = api.sell_for_usdt(bids, quantity)
     if cost is None or short_proceeds is None or cost > LEG_USDT or short_proceeds > LEG_USDT:
         return None
     if acquired < rules['min_qty'] or cost < rules['min_quote'] or short_proceeds < meta['min_notional']:
+        import entry_policy
+        entry_policy.reject('REJECTED_MIN_ORDER_ABOVE_TARGET',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
         logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; minimum size/notional fails at executable prices',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
     if not api.order_size_ok(rules, acquired, cost):
@@ -262,16 +259,28 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     category = spread_category(raw_spread, executable_spread)
     if category is None:
         return None
-    funding, next_funding = fresh_funding(api, future_exchange, symbol)
+    try:
+        funding, next_funding = fresh_funding(api, future_exchange, symbol)
+    except Exception as exc:
+        import entry_policy
+        entry_policy.reject('REJECTED_UNKNOWN_FUNDING',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
+        exc.entry_rejection_counted=True
+        raise
     now = time.time()
-    if category == 'NEGATIVE' and (funding <= 0 or next_funding - now < 4 * 3600):
-        return None
     crosses_funding = next_funding <= now + 60 * 60
     # Short pays negative funding; a possible positive receipt is not booked.
     funding_debit = funding_expense(funding, 'short', short_proceeds, crosses_funding)
     price = spot_ask
-    spot_exit = quantity * price * (1 - EXIT_SLIPPAGE) * (1 - buy_fee)
-    cover = quantity * price * (1 + EXIT_SLIPPAGE)
+    # Model convergence to the current Spot reference; use actual exit-side
+    # depth impact as a floor, in addition to the existing exit reserve.
+    if not spot_bids or not future_asks:raise ValueError('Exit depth unavailable')
+    exit_sale=api.sell_for_usdt(spot_bids,quantity)
+    exit_cover=spot_cost(future_asks,quantity,api)
+    if exit_sale is None or exit_cover is None:raise ValueError('Exit depth unavailable')
+    spot_exit_slip=max(EXIT_SLIPPAGE,1-exit_sale/(quantity*api.dec(spot_bids[0][0])))
+    future_exit_slip=max(EXIT_SLIPPAGE,exit_cover/(quantity*api.dec(future_asks[0][0]))-1)
+    spot_exit = quantity * price * (1 - spot_exit_slip) * (1 - buy_fee)
+    cover = quantity * price * (1 + future_exit_slip)
     open_fee = short_proceeds * perp_fee
     close_fee = cover * perp_fee
     price_buffer = cost * PRICE_BUFFER_PCT / 100
@@ -279,7 +288,7 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     pct = projected / cost * 100
     if time.time() - sampled_from > 30:
         raise ValueError('Entry quotes expired')
-    return {'verified_at': sampled_from, 'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
+    return {'entry_policy': 'positive_net_v1', 'verified_at': sampled_from, 'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
             'category': category, 'raw_spread_pct': raw_spread,
             'executable_spread_pct': executable_spread,
             'quantity': quantity, 'spot_entry': cost / acquired,
@@ -337,9 +346,9 @@ def scan(api):
             item = evaluate(api, symbol, spot, future, funding)
             if item and qualifies(item):
                 found.append(item)
-            elif item and item['funding_filtered']:
-                logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING: nonpositive rate',
-                             symbol, spot, future)
+            elif item:
+                import entry_policy
+                entry_policy.reject(entry_policy.reason(item),item)
         except Exception as exc:
             response = getattr(exc, 'response', None)
             status = getattr(response, 'status_code', None)
@@ -347,6 +356,9 @@ def scan(api):
                 retry_after = getattr(response, 'headers', {}).get('Retry-After', '') if response else ''
                 delay = max(3600, int(retry_after)) if retry_after.isdigit() else 3600
                 api_blocked_until[future] = time.time() + delay
+            import entry_policy
+            if not getattr(exc,'entry_rejection_counted',False):
+                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future})
             logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
                             future, type(exc).__name__, status or '-',
                             (getattr(response, 'url', '') or '').split('?')[0])
@@ -375,6 +387,9 @@ def scan(api):
             episode_id = paper.record(item)
             if episode_id is None:
                 continue  # Same continuous spread episode.
+            import virtual
+            item['used_capital']=virtual.capital(item['spot_cost'],item['future_notional'])
+            logging.info('VIRTUAL OPEN verified: episode=%s symbol=%s Spot=%s Futures=%s expected_net_return_pct=%s expected_net_usdt=%s',episode_id,item['symbol'],item['spot'],item['future'],item['pct'],item['projected'])
             api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol'], item.get('category', 'POSITIVE')))
             last_alert[key] = now
             dispatched+=1
@@ -391,7 +406,7 @@ def format_alert(x):
     remaining = max(0, int(x['next_funding_at'] - time.time()))
     raw = x.get('raw_spread_pct', (x.get('future_bid', x['future_entry']) / x.get('spot_ask', x['spot_entry']) - 1) * 100)
     executable = x.get('executable_spread_pct', (x['future_entry'] / x['spot_entry'] - 1) * 100)
-    return (f"{title}\nМонета: {x['symbol']}\n"
+    return (f"VIRTUAL OPEN — {title}\nEntry filter: POSITIVE NET ✅\nUsed capital: {x.get('used_capital', 'unknown')} USDT\nМонета: {x['symbol']}\n"
             f"Spot: {x['spot']}; Futures: {x['future']}\n"
             f"Размер каждой ноги: до ${LEG_USDT:.0f}; общий лимит капитала: 50% виртуального депозита.\n"
             f"Spot Ask: {x.get('spot_ask', x['spot_entry']):.8g}; Futures Bid: {x.get('future_bid', x['future_entry']):.8g} USDT.\n"

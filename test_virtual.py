@@ -21,9 +21,14 @@ class VirtualTests(unittest.TestCase):
         patch.object(basis,'futures_fee',return_value=D('.001')).start()
         self.funding=patch.object(basis,'fresh_funding',return_value=(D('.0001'),time.time()+18000)).start()
         self.api.fee.return_value=D('.001')
-        item=example();item['paper_budget_usdt']=D(50);item['next_funding_at']=time.time()+18000
+        item=example();item['projected']=item['spot_cost']*item['pct']/100;item['paper_budget_usdt']=D(50);item['next_funding_at']=time.time()+18000
         item['raw_spread_pct']=D(2);item['executable_spread_pct']=D('1.8')
         self.item=item;self.ident=paper.record(item,self.path)
+        # Existing lifecycle fixtures model legacy episodes, not the new policy.
+        with paper.session(self.path) as db:
+            row=db.execute('SELECT cost_snapshot_json FROM episodes WHERE id=?',(self.ident,)).fetchone()
+            snap=json.loads(row['cost_snapshot_json']);snap.pop('entry_policy',None)
+            db.execute('UPDATE episodes SET cost_snapshot_json=? WHERE id=?',(json.dumps(snap),self.ident))
     def quote(self,spread):
         return {'at':time.time(),'spread':str(spread),'spot_bid':'10','futures_ask':'10.1','spot_exit':'10','future_exit':'10.1','fees':'.1514','trading_net':'.2486','net_pnl':'.2486','funding_status':'no settlement crossed'}
     def state(self):

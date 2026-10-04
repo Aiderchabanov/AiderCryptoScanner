@@ -356,9 +356,15 @@ def observe(api, path=None):
                 entry = D(e['executable_spread_pct'])
                 converged = abs(spread) <= paper.CLOSED_PCT
                 update_metrics(db,e,q,converged)
+                new_policy=json.loads(e['cost_snapshot_json']).get('entry_policy')=='positive_net_v1'
                 if converged:
-                    close_db(db,e,q)
-                    continue
+                    if not new_policy or (q['net_pnl'] is not None and D(q['net_pnl'])>=0):
+                        close_db(db,e,q)
+                        continue
+                    reason='CONVERGED_BUT_NET_NEGATIVE' if q['net_pnl'] is not None else 'UNKNOWN_SETTLEMENT_PNL'
+                    q['auto_close_blocked_reason']=reason
+                    db.execute('UPDATE virtual_state SET current_json=? WHERE episode_id=?',(json.dumps(q),e['episode_id']))
+                    db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(f'auto_close_reason:{e["episode_id"]}',reason))
                 previous = D(current['last_notice_spread'])
                 if abs(spread-previous) >= D('1.5'):
                     event(db,f"move:{e['episode_id']}:{q['at']}",e['episode_id'],f"VIRTUAL #{e['episode_id']} {e['symbol']}\n{pnl_line(q)}")
@@ -581,7 +587,8 @@ def confirm(api,token,chat,user,path=None):
             ident=paper.record(item,path, parent_id=e['episode_id'], connection=db)
             if ident is None: raise ValueError('Entry/budget rejected')
             db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?)',(key,str(ident)))
-            event(db,f'entry:{ident}',ident,f"VIRTUAL дополнительный entry #{ident}, parent #{e['episode_id']}; BUY Spot + SHORT Futures. Реальных ордеров нет.")
+            item['used_capital']=capital(item['spot_cost'],item['future_notional'])
+            event(db,f'entry:{ident}',ident,api.basis.format_alert(item)+f"\nДополнительный entry #{ident}, parent #{e['episode_id']}")
         else:
             close_db(db,e,q)
     dispatch(api,path)
