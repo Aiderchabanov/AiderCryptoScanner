@@ -96,6 +96,49 @@ class VirtualRiskTests(unittest.TestCase):
         with paper.session(self.path) as db:
             self.assertEqual(db.execute('SELECT state FROM virtual_events').fetchone()[0],'cancelled')
 
+    def test_notified_minus_050_not_repeated_in_spread_only_alert(self):
+        self.observe(net='-.30');self.observe(net='-.53')
+        self.api.telegram.reset_mock()
+        self.observe(spread='2.8',net='-.66')
+        self.assertEqual(self.api.telegram.call_count,1)
+        body=self.api.telegram.call_args.args[0]
+        self.assertIn('SPREAD EXPANDED: +1.0 p.p.',body)
+        self.assertNotIn('NET P&L crossed:',body)
+        self.assertIn('Current Net P&L: -0.6600 USDT',body)
+
+    def test_new_minus_050_and_new_spread_grouped_only_new_events(self):
+        self.observe(net='-.30');self.api.telegram.reset_mock()
+        self.observe(spread='2.8',net='-.53')
+        self.assertEqual(self.api.telegram.call_count,1)
+        body=self.api.telegram.call_args.args[0]
+        self.assertIn('SPREAD EXPANDED: +1.0 p.p.',body)
+        self.assertIn('NET P&L crossed: <= -0.50 USDT',body)
+        self.assertNotIn('<= -0.20 USDT',body)
+
+    def test_restart_preserves_notified_pnl_in_spread_only_alert(self):
+        self.observe(net='-.53');virtual.bootstrap(self.path)
+        self.api.telegram.reset_mock();self.observe(spread='2.8',net='-.66')
+        self.assertEqual(self.api.telegram.call_count,1)
+        self.assertNotIn('NET P&L crossed:',self.api.telegram.call_args.args[0])
+
+    def test_legacy_notified_state_migration_no_duplicate(self):
+        with paper.session(self.path) as db:
+            db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?)',
+                       (f'risk_levels:{self.ident}',json.dumps({'pnl_warning_level':2,'spread_expansion_level':0,'generation':1})))
+        self.observe(spread='2.8',net='-.66')
+        self.assertEqual(self.api.telegram.call_count,1)
+        self.assertNotIn('NET P&L crossed:',self.api.telegram.call_args.args[0])
+        self.assertEqual(self.levels()['pnl_notified'],['-0.20','-0.50'])
+
+    def test_old_snapshot_does_not_rearm_threshold(self):
+        self.observe(net='-.53')
+        e=virtual.load(self.ident,self.path);q=self.quote('1.8');q['net_pnl']='-.30'
+        q['at']=self.levels()['last_sample_at']-1
+        with paper.session(self.path) as db:virtual.risk_alert(db,e,q)
+        self.api.telegram.reset_mock();self.observe(spread='2.8',net='-.66')
+        self.assertEqual(self.api.telegram.call_count,1)
+        self.assertNotIn('NET P&L crossed:',self.api.telegram.call_args.args[0])
+
     def test_uncertain_send_is_not_duplicated(self):
         self.api.telegram.side_effect=RuntimeError('delivery uncertain')
         self.observe(net='-.20');virtual.bootstrap(self.path);self.observe(net='-.25')

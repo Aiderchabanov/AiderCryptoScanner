@@ -342,6 +342,9 @@ def risk_alert(db, e, q):
     key=f'risk_levels:{ident}'
     saved=db.execute('SELECT value FROM virtual_meta WHERE name=?',(key,)).fetchone()
     state=json.loads(saved['value']) if saved else {'pnl_warning_level':0,'spread_expansion_level':0,'generation':0}
+    # Ignore repeated/out-of-order snapshots: they must not reset notified state.
+    if q['at'] <= state.get('last_sample_at',0):
+        return
     entry=number(e['executable_spread_pct'])
     spread=number(q['spread'])
     expansion=spread-entry
@@ -349,12 +352,30 @@ def risk_alert(db, e, q):
     crossed_spread=list(range(state['spread_expansion_level']+1,spread_level+1))
     thresholds=(D('-.20'),D('-.50'),D('-1.00'))
     net=number(q['net_pnl']) if q.get('net_pnl') is not None else None
-    pnl_level=state['pnl_warning_level'] if net is None else sum(net<=level for level in thresholds)
-    crossed_pnl=thresholds[state['pnl_warning_level']:pnl_level]
-    # Unknown P&L never rearms a loss threshold as if it had recovered.
-    state['pnl_warning_level']=pnl_level
+    # Migrate existing levels as already notified; restart cannot reintroduce them.
+    notified=set(state.get('pnl_notified', [str(level) for level in thresholds[:state['pnl_warning_level']]]))
+    previous_net=number(state['last_known_net_pnl']) if state.get('last_known_net_pnl') is not None else None
+    new_pnl=[]
+    if net is not None:
+        for threshold in thresholds:
+            name=str(threshold)
+            if net > threshold:
+                notified.discard(name)  # Confirmed recovery above this specific threshold.
+            elif name not in notified and (previous_net is None or previous_net > threshold):
+                new_pnl.append(threshold)
+                notified.add(name)
+        state['last_known_net_pnl']=str(net)
+        state['pnl_warning_level']=sum(net<=level for level in thresholds)
+    # UNKNOWN never resets a threshold or replaces the last known P&L with zero.
+    state['pnl_notified']=[str(level) for level in thresholds if str(level) in notified]
     state['spread_expansion_level']=spread_level
-    if crossed_spread or crossed_pnl:
+    state['last_sample_at']=q['at']
+    new_events=[]
+    if crossed_spread:
+        new_events.append(('spread',crossed_spread))
+    if new_pnl:
+        new_events.append(('pnl',new_pnl))
+    if new_events:
         state['generation']+=1
         live=db.execute('SELECT value FROM virtual_meta WHERE name=?',(f'funding_live:{ident}',)).fetchone()
         funding=json.loads(live['value']) if live else {}
@@ -363,10 +384,11 @@ def risk_alert(db, e, q):
         remaining=int(funding['next_at']-time.time()) if fresh else None
         next_text=f"{remaining//60} min {remaining%60} sec" if remaining is not None else 'UNKNOWN'
         reasons=[]
-        if crossed_spread:
-            reasons.append('SPREAD EXPANDED: '+', '.join(f'+{level}.0 p.p.' for level in crossed_spread))
-        if crossed_pnl:
-            reasons.append('NET P&L crossed: '+', '.join(f'<= {level:.2f} USDT' for level in crossed_pnl))
+        for kind,levels in new_events:
+            if kind=='spread':
+                reasons.append('SPREAD EXPANDED: '+', '.join(f'+{level}.0 p.p.' for level in levels))
+            else:
+                reasons.append('NET P&L crossed: '+', '.join(f'<= {level:.2f} USDT' for level in levels))
         net_text=f'{net:+.4f} USDT' if net is not None else 'UNKNOWN (funding settlement / full result unconfirmed)'
         body=(f"⚠️ VIRTUAL RISK ALERT #{ident} {e['symbol']}\n"+'\n'.join(reasons)+'\n'
               f"Spot: {e['spot_exchange']}\nFutures: {e['futures_exchange']}\n"
@@ -375,7 +397,7 @@ def risk_alert(db, e, q):
               f"Funding: {funding_text}\nTime to next funding: {next_text}\n"
               "PAPER / VIRTUAL ONLY\nNo averaging / no real orders")
         event(db,f"risk:{ident}:{state['generation']}",ident,body)
-        logging.info('Virtual risk alert queued: episode #%s; pnl_warning_level=%s; spread_expansion_level=%s',ident,pnl_level,spread_level)
+        logging.info('Virtual risk alert queued: episode #%s; new_events=%s; pnl_warning_level=%s; spread_expansion_level=%s',ident,[(kind,[str(level) for level in levels]) for kind,levels in new_events],state['pnl_warning_level'],spread_level)
     db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(key,json.dumps(state)))
 
 def observe(api, path=None):
