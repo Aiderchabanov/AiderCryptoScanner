@@ -12,6 +12,7 @@ from flask import Flask
 import basis
 import paper
 import exchanges
+import binance_io
 
 BINANCE = 'https://api.binance.com'
 GATE = 'https://api.gateio.ws/api/v4'
@@ -74,19 +75,25 @@ def log_binance_commission_response(response):
 
 
 def get_json(url, **kwargs):
+    if urlparse(url).netloc in binance_io.HOSTS:
+        with binance_io.lock:
+            return _get_json(url, **kwargs)
+    return _get_json(url, **kwargs)
+
+
+def _get_json(url, **kwargs):
     parsed = urlparse(url)
     host_key = parsed.netloc
     path_key = (parsed.netloc, parsed.path)
     now = time.monotonic()
     public_diagnostic = host_key == 'fapi.binance.com' and parsed.path in ('/fapi/v1/ticker/bookTicker','/fapi/v1/exchangeInfo')
-    if host_key == 'fapi.binance.com' and host_key not in api_blocked_until:
+    if host_key in binance_io.HOSTS and host_key not in api_blocked_until:
         try:
             until = paper.load_api_backoff(host_key)
             api_blocked_until[host_key] = max(now, now + until - time.time())
         except Exception:
-            # A missing paper database already prevents basis alerts. Keep
-            # the spot scanner independent of that database.
-            logging.warning('Binance futures backoff storage unavailable')
+            # Fail closed if the persisted Binance cooldown cannot be read.
+            logging.warning('Binance backoff storage unavailable: host=%s', host_key)
             api_blocked_until[host_key] = now + 3600
     if now < max(api_blocked_until.get(host_key, 0), api_blocked_until.get(path_key, 0)):
         if public_diagnostic:
@@ -94,6 +101,18 @@ def get_json(url, **kwargs):
             until=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime(time.time()+remaining))
             logging.warning('Binance futures public GET %s: HTTP=not_requested exception=RuntimeError message=active persisted/local cooldown; remaining=%.0fs until=%s; Retry-After=honored; no HTTP request sent',parsed.path,remaining,until)
         raise RuntimeError('Exchange API temporarily unavailable')
+    if host_key in binance_io.HOSTS:
+        reused = binance_io.reuse(host_key, parsed.path, kwargs.get('params'))
+        if reused is not None:
+            return reused
+        binance_io.pace(host_key, parsed.path, kwargs.get('params'))
+        # Pacing may delay a signed request: sign its actual parameters at dispatch.
+        if kwargs.get('headers', {}).get('X-MBX-APIKEY') and BINANCE_SECRET:
+            params = dict(kwargs.get('params') or {})
+            params.pop('signature', None)
+            params['timestamp'] = int(time.time() * 1000)
+            params['signature'] = hmac.new(BINANCE_SECRET.encode(), urlencode(params).encode(), hashlib.sha256).hexdigest()
+            kwargs['params'] = params
     try:
         response = requests.get(url, timeout=10, **kwargs)
     except requests.RequestException as exc:
@@ -120,14 +139,14 @@ def get_json(url, **kwargs):
     if response.status_code in (401, 403, 418, 429):
         retry = response.headers.get('Retry-After', '')
         base_delay = 3600 if response.status_code in (401, 403, 418) else 60
-        delay = max(base_delay, int(retry)) if retry.isdigit() else base_delay
+        delay = max(base_delay, binance_io.retry_seconds(retry)) if host_key in binance_io.HOSTS else (max(base_delay, int(retry)) if retry.isdigit() else base_delay)
         block_key = host_key if response.status_code in (418, 429) else path_key
         api_blocked_until[block_key] = time.monotonic() + delay
-        if host_key == 'fapi.binance.com' and response.status_code in (418, 429):
+        if host_key in binance_io.HOSTS and response.status_code in (418, 429):
             try:
                 paper.save_api_backoff(host_key, time.time() + delay)
             except Exception:
-                logging.warning('Binance futures backoff could not be persisted')
+                logging.warning('Binance backoff could not be persisted: host=%s', host_key)
         error_label = ''
         if host_key == 'api.gateio.ws' and response.status_code == 401:
             try:
@@ -140,10 +159,20 @@ def get_json(url, **kwargs):
         logging.warning('Exchange API HTTP %s%s at %s%s; paused %ss',
                         response.status_code, error_label, parsed.netloc, parsed.path, delay)
     response.raise_for_status()
-    return response.json()
+    result = response.json()
+    if host_key in binance_io.HOSTS:
+        binance_io.remember(host_key, parsed.path, kwargs.get('params'), result)
+    return result
 
 
 def cached(key, ttl, loader):
+    if isinstance(key, tuple) and 'Binance' in key:
+        with binance_io.lock:
+            return _cached(key, ttl, loader)
+    return _cached(key, ttl, loader)
+
+
+def _cached(key, ttl, loader):
     old = cache.get(key)
     if old and time.monotonic() < old[0]:
         return old[1]
@@ -338,7 +367,7 @@ def spot_rules(exchange, symbol, side):
                 'max_quote': min(max_values) if max_values else None, 'step': step,
                 'market_max_qty': None, 'market_max_quote': None}
     # Trading status is checked on each scan. Structural limits can be cached briefly.
-    return cached(('spot-rules', exchange, symbol, side), 30, load)
+    return cached(('spot-rules', exchange, symbol, 'both' if exchange == 'Binance' else side), 30, load)
 
 
 def order_size_ok(rules, quantity, notional):
@@ -423,7 +452,7 @@ def orderbook(exchange, symbol):
         pair = symbol[:-4] + '_USDT'
         result = gate('/spot/order_book', {'currency_pair': pair, 'limit': 500})
         return result.get('asks', []), result.get('bids', [])
-    result = binance('/api/v3/depth', {'symbol': symbol, 'limit': 500})
+    result = binance('/api/v3/depth', {'symbol': symbol, 'limit': 100})
     return result.get('asks', []), result.get('bids', [])
 
 

@@ -137,7 +137,7 @@ def futures_book(api, exchange, symbol, multiplier):
         return api.bingx.orderbook(symbol, futures=True)
     if exchange == 'Binance':
         row = api.get_json(FUTURES_BINANCE + '/fapi/v1/depth',
-                           params={'symbol': symbol, 'limit': 100})
+                           params={'symbol': symbol, 'limit': 50})
         return row['asks'], row['bids']
     row = api.gate('/futures/usdt/order_book',
                    {'contract': symbol[:-4] + '_USDT', 'limit': 100})

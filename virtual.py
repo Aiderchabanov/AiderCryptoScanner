@@ -1,5 +1,6 @@
 """Persistent PAPER lifecycle. Exchange calls are read-only; no order API exists here."""
 import json
+import binance_io
 import logging
 import math
 import os
@@ -482,6 +483,7 @@ def dispatch(api,path=None):
             logging.warning('Virtual notification delivery uncertain (%s)',type(exc).__name__)
 
 
+@binance_io.fresh
 def verified_entry(api,e):
     started = time.monotonic()
     item = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])

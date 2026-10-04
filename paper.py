@@ -154,7 +154,17 @@ def load_api_backoff(host):
     """Read a host ban deadline across deploys, without storing credentials."""
     with session() as db:
         row = db.execute('SELECT until_at FROM api_backoff WHERE host=?', (host,)).fetchone()
-        return float(first_value(row)) if row else 0
+        until = float(first_value(row)) if row else 0
+        if host in ('api.binance.com', 'fapi.binance.com'):
+            # Read existing Monitor bans too, including Spot bans saved before
+            # the shared GET gate was introduced. No schema changes.
+            exists = db.execute("SELECT to_regclass('risk_hosts')") if getattr(db, 'is_postgres', False) else db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='risk_hosts'")
+            table = exists.fetchone()
+            if table and first_value(table):
+                risk = db.execute('SELECT until_at FROM risk_hosts WHERE host=?', (host,)).fetchone()
+                if risk:
+                    until = max(until, float(first_value(risk)))
+        return until
 
 
 def save_api_backoff(host, until_at):
