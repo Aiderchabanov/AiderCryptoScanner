@@ -3,6 +3,8 @@ import copy
 import functools
 import logging
 import math
+import re
+from collections import deque
 import threading
 import time
 from email.utils import parsedate_to_datetime
@@ -12,7 +14,8 @@ lock = threading.RLock()
 local = threading.local()
 next_request = 0.0
 snapshots = {}
-counts = {}
+request_history = deque()
+weight_headers = {}
 last_report = 0.0
 last_clock = 0.0
 PUBLIC_TTL = 1.0
@@ -31,15 +34,27 @@ def fresh(function):
     return wrapped
 
 
-def retry_seconds(value):
+def parse_retry_after(value):
     try:
         n = float(value)
-        return max(0, n) if math.isfinite(n) else 0
+        return max(0, n) if math.isfinite(n) else None
     except (TypeError, ValueError):
         try:
             return max(0, parsedate_to_datetime(value).timestamp() - time.time())
         except (TypeError, ValueError, OverflowError):
-            return 0
+            return None
+
+
+def retry_seconds(value):
+    return parse_retry_after(value) or 0
+
+
+def cooldown_seconds(status, retry_after):
+    """Honor a supplied Binance deadline; defaults apply only if absent/invalid."""
+    supplied = parse_retry_after(retry_after)
+    if status in (418, 429):
+        return supplied if supplied is not None else (3600 if status == 418 else 60)
+    return max(3600, supplied or 0)
 
 
 def key(host, path, params):
@@ -75,7 +90,7 @@ def weight(path, params):
 
 
 def pace(host, path, params):
-    global next_request, last_report, last_clock
+    global next_request, last_clock
     if time.monotonic() < last_clock:
         next_request = time.monotonic()
     wait = max(0, next_request - time.monotonic())
@@ -87,15 +102,44 @@ def pace(host, path, params):
     # Combined ceiling 20 estimated weight/s, plus no overlapping Binance GETs.
     next_request = now + max(0.25, request_weight / 20)
     local.started = now
-    item = counts.setdefault((host, path), [0, 0])
-    item[0] += 1
-    item[1] += request_weight
+
+
+def rolling_load(now=None):
+    now = time.monotonic() if now is None else now
+    while request_history and request_history[0][0] <= now - 60:
+        request_history.popleft()
+    return {'requests': len(request_history),
+            'estimated_weight': sum(item[3] for item in request_history)}
+
+
+def request_started(host, path, params):
+    """Called immediately before a real GET, never for cache hits/cooldown."""
+    global last_report
+    now = time.monotonic()
+    if request_history and now < request_history[-1][0]:
+        request_history.clear()
+    request_history.append((now, host, path, weight(path, params)))
+    snapshot = rolling_load(now)
     if now - last_report >= 60:
-        logging.info('Binance GET load: requests=%s estimated_weight=%s endpoints=%s',
-                     sum(v[0] for v in counts.values()), sum(v[1] for v in counts.values()),
-                     {h + p: v[0] for (h, p), v in counts.items()})
-        counts.clear()
+        logging.info('Binance REST rolling load: requests_last_60s=%s estimated_weight_last_60s=%s',
+                     snapshot['requests'], snapshot['estimated_weight'])
         last_report = now
+
+
+def response_observed(host, path, response):
+    # Only allow numeric Binance weight headers, never arbitrary header values.
+    numeric = {}
+    for name, value in response.headers.items():
+        name = name.lower()
+        if re.fullmatch(r'x-mbx-used-weight(?:-[0-9]+[smhd])?', name) and isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 12:
+            numeric[name] = int(value)
+    if numeric:
+        weight_headers[host] = {'at': time.monotonic(), 'values': numeric}
+    if response.status_code in (418, 429):
+        snapshot = rolling_load()
+        logging.warning('Binance REST rate limit: HTTP=%s requests_last_60s_before_429=%s estimated_weight_last_60s_before_429=%s binance_used_weight_header=%s endpoint_that_triggered_429=%s%s; counts include triggering GET; weight_header_reliable=%s',
+                        response.status_code, snapshot['requests'], snapshot['estimated_weight'], numeric or 'unknown', host, path,
+                        not (host == 'fapi.binance.com' and path == '/fapi/v1/ticker/bookTicker'))
 
 
 def remember(host, path, params, result):

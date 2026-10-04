@@ -113,6 +113,8 @@ def _get_json(url, **kwargs):
             params['timestamp'] = int(time.time() * 1000)
             params['signature'] = hmac.new(BINANCE_SECRET.encode(), urlencode(params).encode(), hashlib.sha256).hexdigest()
             kwargs['params'] = params
+    if host_key in binance_io.HOSTS:
+        binance_io.request_started(host_key, parsed.path, kwargs.get('params'))
     try:
         response = requests.get(url, timeout=10, **kwargs)
     except requests.RequestException as exc:
@@ -120,6 +122,8 @@ def _get_json(url, **kwargs):
             label='timeout' if isinstance(exc,requests.Timeout) else 'transport failure'
             logging.warning('Binance futures public GET %s: HTTP=no_response exception=%s message=%s Retry-After=unavailable',parsed.path,type(exc).__name__,label)
         raise
+    if host_key in binance_io.HOSTS:
+        binance_io.response_observed(host_key, parsed.path, response)
     if public_diagnostic:
         retry=response.headers.get('Retry-After','')
         safe_retry=retry if isinstance(retry,str) and retry.isdigit() and len(retry)<=12 else 'absent_or_non_numeric'
@@ -139,7 +143,7 @@ def _get_json(url, **kwargs):
     if response.status_code in (401, 403, 418, 429):
         retry = response.headers.get('Retry-After', '')
         base_delay = 3600 if response.status_code in (401, 403, 418) else 60
-        delay = max(base_delay, binance_io.retry_seconds(retry)) if host_key in binance_io.HOSTS else (max(base_delay, int(retry)) if retry.isdigit() else base_delay)
+        delay = binance_io.cooldown_seconds(response.status_code, retry) if host_key in binance_io.HOSTS else (max(base_delay, int(retry)) if retry.isdigit() else base_delay)
         block_key = host_key if response.status_code in (418, 429) else path_key
         api_blocked_until[block_key] = time.monotonic() + delay
         if host_key in binance_io.HOSTS and response.status_code in (418, 429):

@@ -11,6 +11,7 @@ from email.utils import parsedate_to_datetime
 import requests
 import paper
 import bingx
+import binance_io
 
 EXCHANGES=('Binance','Gate','BingX')
 ENDPOINTS={
@@ -184,7 +185,7 @@ class Monitor:
                 response=getattr(exc,'response',None)
                 if response is not None:
                     code=response.status_code
-                    delay=max(retry_seconds(response.headers.get('Retry-After')),3600 if code in (401,403,418) else 60 if code==429 else 0)
+                    delay=binance_io.cooldown_seconds(code,response.headers.get('Retry-After')) if exchange=='Binance' and code in (401,403,418,429) else max(retry_seconds(response.headers.get('Retry-After')),3600 if code in (401,403,418) else 60 if code==429 else 0)
                     if delay:self.block(host,delay,'HTTP '+str(code))
                     raise HealthError('HTTP '+str(code),delay) from None
                 raise HealthError('TRANSPORT_UNAVAILABLE') from None

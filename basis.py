@@ -5,6 +5,7 @@ import os
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
 import paper
+import binance_io
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
 TARGET_LEG_USDT = Decimal('30')
@@ -129,7 +130,7 @@ def futures_fee(api, exchange, symbol):
         if exchange == 'Binance':
             logging.info('Binance Futures personal commission OK: HTTP status=200; taker_rate=%s',value)
         return value
-    return api.cached(('basis-futures-fee', exchange, symbol), 60, load)
+    return api.cached(('basis-futures-fee', exchange, symbol), 3600 if exchange == 'Binance' else 60, load)
 
 
 def futures_book(api, exchange, symbol, multiplier):
@@ -353,8 +354,13 @@ def scan(api):
             response = getattr(exc, 'response', None)
             status = getattr(response, 'status_code', None)
             if status in (401, 403, 418, 429):
-                retry_after = getattr(response, 'headers', {}).get('Retry-After', '') if response else ''
-                delay = max(3600, int(retry_after)) if retry_after.isdigit() else 3600
+                if future == 'Binance':
+                    retry_after = getattr(response, 'headers', {}).get('Retry-After', '') if response is not None else ''
+                    delay = binance_io.cooldown_seconds(status, retry_after)
+                else:
+                    # Preserve the existing Gate/BingX handling.
+                    retry_after = getattr(response, 'headers', {}).get('Retry-After', '') if response else ''
+                    delay = max(3600, int(retry_after)) if retry_after.isdigit() else 3600
                 api_blocked_until[future] = time.time() + delay
             import entry_policy
             if not getattr(exc,'entry_rejection_counted',False):
