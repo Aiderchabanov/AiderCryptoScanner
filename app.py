@@ -623,6 +623,11 @@ def paper_loop():
 
 
 
+@app.get('/healthz')
+def healthz():
+    return {'status': 'ok'}, 200
+
+
 @app.get('/')
 def home():
     return {'status': 'ok', 'scanner': 'Spot→Futures Binance-Gate-BingX', 'spot_spot_enabled': SPOT_SPOT_ENABLED, 'min_net_profit_pct': float(THRESH),
