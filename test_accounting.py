@@ -70,15 +70,15 @@ class AccountingTests(unittest.TestCase):
             self.assertIsNone(virtual.realized_result(q))
 
     def test_auto_and_manual_close_same_realized(self):
-        q=self.complete_quote('-.15')
+        q=self.complete_quote('.15')
         with patch.object(virtual,'quote',return_value=q):virtual.observe(self.api,self.path)
-        self.assertEqual(json.loads(self.state()['close_json'])['realized_net_pnl_usdt'],'-0.15')
+        self.assertEqual(json.loads(self.state()['close_json'])['realized_net_pnl_usdt'],'0.15')
         self.ident=paper.record(self.item,self.path)
         q=self.complete_quote('.7');q['spread']='1'
         with patch.object(virtual,'quote',return_value=q):
             token=virtual.preview(self.api,'close',self.ident,'123','123',self.path)
             virtual.confirm(self.api,token,'123','123',self.path)
-        self.assertEqual(virtual.accounting(self.path)['confirmed_realized_pnl'],D('.55'))
+        self.assertEqual(virtual.accounting(self.path)['confirmed_realized_pnl'],D('.85'))
 
     def test_status_safe_and_unknown_unrealized(self):
         with patch.object(virtual,'quote',side_effect=ValueError('unavailable')):

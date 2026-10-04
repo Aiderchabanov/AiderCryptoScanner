@@ -356,9 +356,8 @@ def observe(api, path=None):
                 entry = D(e['executable_spread_pct'])
                 converged = abs(spread) <= paper.CLOSED_PCT
                 update_metrics(db,e,q,converged)
-                new_policy=json.loads(e['cost_snapshot_json']).get('entry_policy')=='positive_net_v1'
                 if converged:
-                    if not new_policy or (q['net_pnl'] is not None and D(q['net_pnl'])>=0):
+                    if q['net_pnl'] is not None and number(q['net_pnl'])>=0:
                         close_db(db,e,q)
                         continue
                     reason='CONVERGED_BUT_NET_NEGATIVE' if q['net_pnl'] is not None else 'UNKNOWN_SETTLEMENT_PNL'

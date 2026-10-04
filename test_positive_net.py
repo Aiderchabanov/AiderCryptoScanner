@@ -21,9 +21,9 @@ class PositiveNetTests(unittest.TestCase):
             self.assertIsNotNone(entry_policy.reason(item))
             self.assertIsNone(paper.record(item,self.path))
 
-    def test_new_close_requires_confirmed_nonnegative_net_legacy_preserved(self):
+    def test_all_episodes_close_only_with_known_nonnegative_net(self):
         for policy in (False,True):
-            for net in ('-.15','0','.15',None):
+            for net in ('-.1622','0','.15',None):
                 with self.subTest(policy=policy,net=net):
                     with paper.session(self.path) as db:
                         snap=json.loads(db.execute('SELECT cost_snapshot_json FROM episodes WHERE id=?',(self.ident,)).fetchone()['cost_snapshot_json'])
@@ -31,8 +31,8 @@ class PositiveNetTests(unittest.TestCase):
                         else:snap.pop('entry_policy',None)
                         db.execute('UPDATE episodes SET cost_snapshot_json=? WHERE id=?',(json.dumps(snap),self.ident))
                         db.execute("UPDATE virtual_state SET state='open' WHERE episode_id=?",(self.ident,))
-                    q=self.quote('-.08');q['net_pnl']=net
+                    q=self.quote('-.0964');q['net_pnl']=net
                     with patch.object(virtual,'quote',return_value=q):virtual.observe(self.api,self.path)
-                    self.assertEqual(self.state()['state'],'closed' if not policy or (net is not None and D(net)>=0) else 'open')
-                    if policy and net is None:self.assertEqual(json.loads(self.state()['current_json'])['auto_close_blocked_reason'],'UNKNOWN_SETTLEMENT_PNL')
-                    if policy and net=='-.15':self.assertEqual(json.loads(self.state()['current_json'])['auto_close_blocked_reason'],'CONVERGED_BUT_NET_NEGATIVE')
+                    self.assertEqual(self.state()['state'],'closed' if net is not None and D(net)>=0 else 'open')
+                    if net is None:self.assertEqual(json.loads(self.state()['current_json'])['auto_close_blocked_reason'],'UNKNOWN_SETTLEMENT_PNL')
+                    if net=='-.1622':self.assertEqual(json.loads(self.state()['current_json'])['auto_close_blocked_reason'],'CONVERGED_BUT_NET_NEGATIVE')
