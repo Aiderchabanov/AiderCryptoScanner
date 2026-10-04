@@ -330,6 +330,54 @@ def close_db(db, e, q):
     return True
 
 
+
+def risk_alert(db, e, q):
+    """Observe only: reuse fresh executable quote, persist crossing/rearm state."""
+    if not 0 <= time.time()-q['at'] <= 30:
+        return
+    ident=e['episode_id']
+    current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(ident,)).fetchone()
+    if not current or current['state']!='open':
+        return
+    key=f'risk_levels:{ident}'
+    saved=db.execute('SELECT value FROM virtual_meta WHERE name=?',(key,)).fetchone()
+    state=json.loads(saved['value']) if saved else {'pnl_warning_level':0,'spread_expansion_level':0,'generation':0}
+    entry=number(e['executable_spread_pct'])
+    spread=number(q['spread'])
+    expansion=spread-entry
+    spread_level=max(0,int(expansion))  # Positive widening in percentage points.
+    crossed_spread=list(range(state['spread_expansion_level']+1,spread_level+1))
+    thresholds=(D('-.20'),D('-.50'),D('-1.00'))
+    net=number(q['net_pnl']) if q.get('net_pnl') is not None else None
+    pnl_level=state['pnl_warning_level'] if net is None else sum(net<=level for level in thresholds)
+    crossed_pnl=thresholds[state['pnl_warning_level']:pnl_level]
+    # Unknown P&L never rearms a loss threshold as if it had recovered.
+    state['pnl_warning_level']=pnl_level
+    state['spread_expansion_level']=spread_level
+    if crossed_spread or crossed_pnl:
+        state['generation']+=1
+        live=db.execute('SELECT value FROM virtual_meta WHERE name=?',(f'funding_live:{ident}',)).fetchone()
+        funding=json.loads(live['value']) if live else {}
+        fresh=0 <= time.time()-funding.get('at',0) <= 30 and funding.get('next_at',0)>time.time()
+        funding_text=f"{number(funding['rate'])*100:+.4f}%" if fresh else 'UNKNOWN (fresh funding unavailable)'
+        remaining=int(funding['next_at']-time.time()) if fresh else None
+        next_text=f"{remaining//60} min {remaining%60} sec" if remaining is not None else 'UNKNOWN'
+        reasons=[]
+        if crossed_spread:
+            reasons.append('SPREAD EXPANDED: '+', '.join(f'+{level}.0 p.p.' for level in crossed_spread))
+        if crossed_pnl:
+            reasons.append('NET P&L crossed: '+', '.join(f'<= {level:.2f} USDT' for level in crossed_pnl))
+        net_text=f'{net:+.4f} USDT' if net is not None else 'UNKNOWN (funding settlement / full result unconfirmed)'
+        body=(f"⚠️ VIRTUAL RISK ALERT #{ident} {e['symbol']}\n"+'\n'.join(reasons)+'\n'
+              f"Spot: {e['spot_exchange']}\nFutures: {e['futures_exchange']}\n"
+              f"Entry spread: {entry:+.4f}%\nCurrent executable spread: {spread:+.4f}%\n"
+              f"Expansion: {expansion:+.4f} p.p.\nCurrent Net P&L: {net_text}\n"
+              f"Funding: {funding_text}\nTime to next funding: {next_text}\n"
+              "PAPER / VIRTUAL ONLY\nNo averaging / no real orders")
+        event(db,f"risk:{ident}:{state['generation']}",ident,body)
+        logging.info('Virtual risk alert queued: episode #%s; pnl_warning_level=%s; spread_expansion_level=%s',ident,pnl_level,spread_level)
+    db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(key,json.dumps(state)))
+
 def observe(api, path=None):
     # Manual closure of a continuing gap must not create a fresh entry next scan.
     with paper.session(path) as db:
@@ -343,6 +391,7 @@ def observe(api, path=None):
                     db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"gapreset:{e['episode_id']}",'1'))
         except Exception:
             pass
+    risk_quotes=[]
     for e in rows(path):
         try:
             q = quote(api,e)
@@ -365,6 +414,7 @@ def observe(api, path=None):
                     q['auto_close_blocked_reason']=reason
                     db.execute('UPDATE virtual_state SET current_json=? WHERE episode_id=?',(json.dumps(q),e['episode_id']))
                     db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(f'auto_close_reason:{e["episode_id"]}',reason))
+                risk_quotes.append((e,q))
                 previous = D(current['last_notice_spread'])
                 if abs(spread-previous) >= D('1.5'):
                     event(db,f"move:{e['episode_id']}:{q['at']}",e['episode_id'],f"VIRTUAL #{e['episode_id']} {e['symbol']}\n{pnl_line(q)}")
@@ -378,16 +428,29 @@ def observe(api, path=None):
         except Exception as exc:
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     funding_warnings(api,path)
+    # Reuse funding already refreshed by the existing warning worker; no new GET.
+    for e,q in risk_quotes:
+        try:
+            with paper.session(path) as db:
+                ensure(db); lock(db)
+                risk_alert(db,e,q)
+        except Exception as exc:
+            logging.warning('Virtual risk monitoring #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     dispatch(api,path)
 
 
-def funding_snapshot(api, e):
+def funding_snapshot(api, e, path=None):
     """Fresh schedule and entry-side executable quotes for up to $50 per leg."""
     started = time.monotonic()
     rate, next_at = api.basis.fresh_funding(api,e['futures_exchange'],e['symbol'])
     rate = number(rate)
     if not math.isfinite(next_at) or next_at <= time.time():
         raise ValueError('Next funding unavailable')
+    # Safe metadata from the existing read-only refresh, also reused by risk alerts.
+    with paper.session(path) as db:
+        ensure(db); lock(db)
+        db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",
+                   (f"funding_live:{e['episode_id']}",json.dumps({'at':time.time(),'rate':str(rate),'next_at':next_at})))
     remaining = next_at-time.time()
     if not 0 < remaining <= 1800:
         return None
@@ -413,7 +476,7 @@ def funding_warnings(api,path=None):
     for e in rows(path):
         try:
             # Schedule is refreshed independently of exit P&L/fee availability.
-            q = funding_snapshot(api,e)
+            q = funding_snapshot(api,e,path)
             if q is None:
                 continue
             key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
@@ -476,6 +539,17 @@ def dispatch(api,path=None):
             db.execute("UPDATE virtual_events SET state='claimed' WHERE event_key=?",(row['event_key'],))
     for row in pending:
         try:
+            if row['event_key'].startswith('risk:'):
+                # Only risk events: a concurrent close must cancel, not send, the alert.
+                with paper.session(path) as db:
+                    ensure(db); lock(db)
+                    current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(row['episode_id'],)).fetchone()
+                    if not current or current['state']!='open':
+                        db.execute("UPDATE virtual_events SET state='cancelled' WHERE event_key=?",(row['event_key'],))
+                        continue
+                    api.telegram(row['body'])
+                    db.execute("UPDATE virtual_events SET state='sent' WHERE event_key=?",(row['event_key'],))
+                continue
             api.telegram(row['body'],reply_markup={'inline_keyboard':json.loads(row['buttons_json'])} if row['buttons_json'] else None)
             with paper.session(path) as db:
                 db.execute("UPDATE virtual_events SET state='sent' WHERE event_key=?",(row['event_key'],))

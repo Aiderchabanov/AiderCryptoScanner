@@ -53,7 +53,7 @@ class VirtualTests(unittest.TestCase):
             count=self.api.telegram.call_count
             virtual.bootstrap(self.path)
             virtual.observe(self.api,self.path)
-        self.assertEqual(count,3) # 1.5pp notice and +5/+10 warnings
+        self.assertEqual(count,4) # Existing 1.5pp/+5/+10 notices plus one grouped risk alert.
         self.assertEqual(self.api.telegram.call_count,count)
         self.assertEqual(self.state()['last_warning'],2)
         self.assertEqual(len(virtual.rows(self.path)),1)
@@ -63,7 +63,7 @@ class VirtualTests(unittest.TestCase):
         with patch.object(virtual,'quote',return_value=self.quote('7')):
             virtual.observe(self.api,self.path)
         self.assertEqual(self.state()['last_notice_spread'],'7')
-        self.assertEqual(self.api.telegram.call_count,1)
+        self.assertEqual(self.api.telegram.call_count,2) # Existing +5pp notice and new risk alert.
 
     def test_observe_close_and_capital_release_once(self):
         with patch.object(virtual,'quote',return_value=self.quote('.08')):
