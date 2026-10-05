@@ -106,6 +106,7 @@ def _get_json(url, **kwargs):
         if reused is not None:
             return reused
         binance_io.pace(host_key, parsed.path, kwargs.get('params'))
+        binance_io.server_weight_guard(host_key, parsed.path, kwargs.get('params'))
         # Pacing may delay a signed request: sign its actual parameters at dispatch.
         if kwargs.get('headers', {}).get('X-MBX-APIKEY') and BINANCE_SECRET:
             params = dict(kwargs.get('params') or {})
@@ -147,6 +148,14 @@ def _get_json(url, **kwargs):
         block_key = host_key if response.status_code in (418, 429) else path_key
         api_blocked_until[block_key] = time.monotonic() + delay
         if host_key in binance_io.HOSTS and response.status_code in (418, 429):
+            load = binance_io.rolling_load()
+            observed = binance_io.weight_headers.get(host_key, {})
+            logging.warning('Binance limit outcome: endpoint_that_triggered_limit=%s '
+                            'local_estimated_weight=%s server_used_weight=%s '
+                            'Retry-After_seconds=%s new_cooldown_until=%s',
+                            parsed.path, load['estimated_weight'],
+                            observed.get('binance_server_used_weight_1m', 'UNKNOWN'), delay,
+                            time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + delay)))
             try:
                 paper.save_api_backoff(host_key, time.time() + delay)
             except Exception:
@@ -165,6 +174,7 @@ def _get_json(url, **kwargs):
     response.raise_for_status()
     result = response.json()
     if host_key in binance_io.HOSTS:
+        binance_io.metadata_observed(host_key, parsed.path, result)
         binance_io.remember(host_key, parsed.path, kwargs.get('params'), result)
     return result
 

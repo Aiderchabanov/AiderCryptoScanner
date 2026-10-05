@@ -16,6 +16,11 @@ next_request = 0.0
 snapshots = {}
 request_history = deque()
 weight_headers = {}
+server_weights = {}
+weight_limits = {}
+# A safety policy, NOT an assumed exchange limit. Actual limits come from metadata.
+UNKNOWN_WEIGHT_SAFETY_THRESHOLD = 1000
+SERVER_WEIGHT_HEADROOM_PCT = 80
 last_report = 0.0
 last_clock = 0.0
 PUBLIC_TTL = 1.0
@@ -126,6 +131,55 @@ def request_started(host, path, params):
         last_report = now
 
 
+def metadata_observed(host, path, result):
+    """Use only metadata returned by an existing normal exchangeInfo request."""
+    if path not in ('/api/v3/exchangeInfo', '/fapi/v1/exchangeInfo') or not isinstance(result, dict):
+        return
+    limits = []
+    rows = result.get('rateLimits')
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get('limit')
+        if (row.get('rateLimitType') == 'REQUEST_WEIGHT' and
+                row.get('interval') == 'MINUTE' and row.get('intervalNum') == 1 and
+                isinstance(value, int) and not isinstance(value, bool) and value > 0):
+            limits.append(value)
+    if limits:
+        weight_limits[host] = min(limits)
+
+
+def server_weight_guard(host, path, params):
+    """Fail before HTTP; per-host, independent of exchange Retry-After cooldowns."""
+    now = time.monotonic()
+    samples = server_weights.get(host, deque())
+    while samples and samples[0][0] <= now - 60:
+        samples.popleft()
+    if not samples:
+        return
+    # Keep the high watermark for 60s: minute resets or an inaccurate ticker
+    # header must not erase a high depth header immediately.
+    used = max(item[1] for item in samples)
+    official = weight_limits.get(host)
+    threshold = (official * SERVER_WEIGHT_HEADROOM_PCT // 100
+                 if official is not None else UNKNOWN_WEIGHT_SAFETY_THRESHOLD)
+    blocked = used + weight(path, params) >= threshold
+    snapshot = rolling_load(now)
+    logging.log(logging.WARNING if blocked else logging.INFO,
+                'Binance server weight guard: host=%s local_requests_last_60s=%s '
+                'local_estimated_weight_last_60s=%s binance_server_used_weight_1m=%s '
+                'official_weight_limit_1m=%s safety_threshold=%s '
+                'server_weight_safety_pause=%s request_blocked_before_http=%s blocked_endpoint=%s reason=%s',
+                host, snapshot['requests'], snapshot['estimated_weight'], used,
+                official if official is not None else 'UNKNOWN', threshold,
+                str(blocked).lower(), str(blocked).lower(), path if blocked else '-',
+                'SERVER_WEIGHT_SAFETY_PAUSE' if blocked else '-')
+    if blocked:
+        raise RuntimeError('SERVER_WEIGHT_SAFETY_PAUSE')
+
+
 def response_observed(host, path, response):
     # Only allow numeric Binance weight headers, never arbitrary header values.
     numeric = {}
@@ -134,7 +188,19 @@ def response_observed(host, path, response):
         if re.fullmatch(r'x-mbx-used-weight(?:-[0-9]+[smhd])?', name) and isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 12:
             numeric[name] = int(value)
     if numeric:
-        weight_headers[host] = {'at': time.monotonic(), 'values': numeric}
+        weight_headers[host] = {**weight_headers.get(host, {}),
+                               'at': time.monotonic(), 'values': numeric}
+        one_minute = [numeric[name] for name in
+                      ('x-mbx-used-weight', 'x-mbx-used-weight-1m', 'x-mbx-used-weight-60s')
+                      if name in numeric]
+        if one_minute:
+            now = time.monotonic()
+            samples = server_weights.setdefault(host, deque())
+            while samples and samples[0][0] <= now - 60:
+                samples.popleft()
+            samples.append((now, max(one_minute)))
+            weight_headers[host]['binance_server_used_weight_1m'] = max(one_minute)
+            weight_headers[host]['timestamp'] = time.time()
     if response.status_code in (418, 429):
         snapshot = rolling_load()
         logging.warning('Binance REST rate limit: HTTP=%s requests_last_60s_before_429=%s estimated_weight_last_60s_before_429=%s binance_used_weight_header=%s endpoint_that_triggered_429=%s%s; counts include triggering GET; weight_header_reliable=%s',
