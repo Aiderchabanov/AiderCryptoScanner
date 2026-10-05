@@ -23,6 +23,8 @@ def reason(item,now=None):
 
 def reject(code,item=None,path=None,db=None):
     item=item or {}
+    import entry_diagnostics
+    entry_diagnostics.record(code,item)
     logging.info('Entry rejection: %s symbol=%s Spot=%s Futures=%s expected_net_return_pct=%s',code,item.get('symbol','-'),item.get('spot','-'),item.get('future','-'),item.get('pct','unknown'))
     try:
         import paper,virtual

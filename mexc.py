@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import logging
+import entry_diagnostics as diagnostics
 import os
 import re
 import threading
@@ -172,8 +173,8 @@ class Client:
             raise MEXCUnavailable('MEXC spot side unavailable')
         precision=r.get('baseAssetPrecision')
         if type(precision) is not int or not 0<=precision<=18: raise MEXCUnavailable('MEXC quantity precision UNKNOWN')
-        return {'step':Decimal(1).scaleb(-precision),'min_qty':number(r.get('baseSizePrecision'),strict=True),
-                'min_quote':number(r.get('quoteAmountPrecision'),strict=True),
+        return {'step':Decimal(1).scaleb(-precision),'min_qty':diagnostics.call('MISSING_MIN_QTY', number, r.get('baseSizePrecision'), strict=True),
+                'min_quote':diagnostics.call('MISSING_MIN_NOTIONAL', number, r.get('quoteAmountPrecision'), strict=True),
                 'max_qty':None,'max_quote':number(r['maxQuoteAmount'],strict=True) if r.get('maxQuoteAmount') is not None else None,
                 'market_max_qty':None,'market_max_quote':None}
 
@@ -181,14 +182,14 @@ class Client:
         r=self.contracts().get(symbol)
         if not r: raise MEXCUnavailable('MEXC perpetual mapping UNKNOWN')
         multiplier=number(r.get('contractSize'),strict=True)
-        return {'step':number(r.get('volUnit'),strict=True)*multiplier,
-                'min_qty':number(r.get('minVol'),strict=True)*multiplier,
+        return {'step':diagnostics.call('MISSING_STEP_SIZE', number, r.get('volUnit'), strict=True)*multiplier,
+                'min_qty':diagnostics.call('MISSING_MIN_QTY', number, r.get('minVol'), strict=True)*multiplier,
                 # MEXC documents a minimum contract volume, not a separate minNotional.
                 'min_notional':Decimal(0),'multiplier':multiplier,'funding':None}
 
     def orderbook(self,symbol,futures=False):
         if futures: multiplier=self.futures_meta(symbol)['multiplier']
-        else: self.spot_rules(symbol); multiplier=Decimal(1)
+        else: diagnostics.call('MISSING_SPOT_MARKET_PARAMS', self.spot_rules, symbol); multiplier=Decimal(1)
         r=self.request('futures_depth' if futures else 'spot_depth',{'symbol':pair(symbol) if futures else symbol,'limit':100})
         if not isinstance(r,dict): raise MEXCUnavailable('MEXC depth UNKNOWN')
         if futures: self.fresh_timestamp(r.get('timestamp'))
@@ -228,7 +229,7 @@ class Client:
         if not isinstance(r,dict) or r.get('symbol')!=pair(symbol): raise MEXCUnavailable('MEXC funding UNKNOWN')
         self.fresh_timestamp(r.get('timestamp'))
         rate=number(r.get('fundingRate'),minimum=Decimal('-0.1'))
-        at=float(number(r.get('nextSettleTime'),strict=True)/1000)
+        at=float(diagnostics.call('MISSING_FUNDING_TIMESTAMP', number, r.get('nextSettleTime'), strict=True)/1000)
         if abs(rate)>Decimal('0.1') or at<=time.time(): raise MEXCUnavailable('MEXC funding UNKNOWN')
         return rate,at
 

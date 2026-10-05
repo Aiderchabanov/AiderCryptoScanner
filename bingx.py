@@ -1,4 +1,5 @@
 """Official BingX REST, GET-only allowlist. No order/transfer/withdrawal methods."""
+import entry_diagnostics as diagnostics
 import hashlib
 import hmac
 import os
@@ -239,10 +240,10 @@ class Client:
         row = self.spot_symbols().get(symbol)
         if not row or (row.get('apiStateBuy' if side == 'buy' else 'apiStateSell') is False):
             raise BingXUnavailable('BingX spot inactive')
-        return {'min_qty': number(row.get('minQty')), 'min_quote': number(row.get('minNotional')),
+        return {'min_qty': diagnostics.call('MISSING_MIN_QTY', number, row.get('minQty')), 'min_quote': diagnostics.call('MISSING_MIN_NOTIONAL', number, row.get('minNotional')),
                 'max_qty': number(row.get('maxQty'), strict=True),
                 'max_quote': number(row.get('maxNotional'), strict=True),
-                'step': number(row.get('stepSize'), strict=True),
+                'step': diagnostics.call('MISSING_STEP_SIZE', number, row.get('stepSize'), strict=True),
                 'market_max_qty': None, 'market_max_quote': number(row.get('maxMarketNotional'), strict=True)
                 if row.get('maxMarketNotional') is not None else None}
 
@@ -254,8 +255,8 @@ class Client:
         if type(precision) is not int or not 0 <= precision <= 18:
             raise BingXUnavailable('BingX quantity precision unavailable')
         return {'step': Decimal(1).scaleb(-precision),
-                'min_qty': number(row.get('tradeMinQuantity'), strict=True),
-                'min_notional': number(row.get('tradeMinUSDT')),
+                'min_qty': diagnostics.call('MISSING_MIN_QTY', number, row.get('tradeMinQuantity'), strict=True),
+                'min_notional': diagnostics.call('MISSING_MIN_NOTIONAL', number, row.get('tradeMinUSDT')),
                 'multiplier': Decimal(1), 'funding': None}
 
     def fresh_funding(self, symbol):
@@ -265,7 +266,7 @@ class Client:
         if not isinstance(data, dict) or data.get('symbol') != pair(symbol):
             raise BingXUnavailable('BingX funding unavailable')
         rate = number(data.get('lastFundingRate'), minimum=Decimal('-0.1'))
-        next_at = float(number(data.get('nextFundingTime'), strict=True) / 1000)
+        next_at = float(diagnostics.call('MISSING_FUNDING_TIMESTAMP', number, data.get('nextFundingTime'), strict=True) / 1000)
         # Live premiumIndex responses omit `time`; updateTime is the last
         # settlement and is not the age of this freshly fetched response.
         stamp = float(number(data['time'], strict=True) / 1000) if data.get('time') is not None else time.time()

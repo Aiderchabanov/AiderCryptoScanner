@@ -6,6 +6,7 @@ import time
 from decimal import Decimal, ROUND_DOWN, ROUND_CEILING
 import paper
 import binance_io
+import entry_diagnostics as diagnostics
 
 FUTURES_BINANCE = 'https://fapi.binance.com'
 TARGET_LEG_USDT = Decimal('30')
@@ -196,7 +197,9 @@ def fresh_funding(api, exchange, symbol):
         next_seconds = api.dec(row.get('funding_next_apply'))
         next_at = float(next_seconds) if next_seconds is not None else None
     if rate is None or abs(rate) > Decimal('0.1') or next_at is None or next_at <= time.time():
-        raise ValueError('Current funding rate or next settlement unavailable')
+        exc = ValueError('Current funding rate or next settlement unavailable')
+        exc.missing_mandatory_data = (['MISSING_FUNDING'] if rate is None or abs(rate) > Decimal('0.1') else []) + (['MISSING_FUNDING_TIMESTAMP'] if next_at is None or next_at <= time.time() else [])
+        raise exc
     return rate, next_at
 
 
@@ -215,33 +218,51 @@ def qualifies(item, now=None):
 
 
 def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
+    token = diagnostics.STAGE.set('OTHER_MANDATORY_DATA')
+    try:
+        return _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint)
+    except Exception as exc:
+        if not getattr(exc, 'missing_mandatory_data', None):
+            exc.missing_mandatory_data = diagnostics.classify(exc)
+        raise
+    finally:
+        diagnostics.STAGE.reset(token)
+
+
+def _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     sampled_from = time.time()
-    meta = futures_meta(api, future_exchange, symbol)
-    buy_fee = api.fee(spot_exchange, symbol)
-    perp_fee = futures_fee(api, future_exchange, symbol)
-    spot_book = api.orderbook(spot_exchange, symbol)
-    future_book = futures_book(api, future_exchange, symbol, meta['multiplier'])
+    meta = diagnostics.call('MISSING_FUTURES_MARKET_PARAMS', futures_meta, api, future_exchange, symbol)
+    buy_fee = diagnostics.call('MISSING_SPOT_FEE', api.fee, spot_exchange, symbol)
+    perp_fee = diagnostics.call('MISSING_FUTURES_FEE', futures_fee, api, future_exchange, symbol)
+    spot_book = diagnostics.call('MISSING_SPOT_DEPTH', api.orderbook, spot_exchange, symbol)
+    future_book = diagnostics.call('MISSING_FUTURES_DEPTH', futures_book, api, future_exchange, symbol, meta['multiplier'])
     if getattr(api, 'multi_exchange', False):
         import virtual
-        spot_book = virtual.checked_book(spot_book)
-        future_book = virtual.checked_book(future_book)
+        spot_book = diagnostics.call('MISSING_SPOT_DEPTH', virtual.checked_book, spot_book)
+        future_book = diagnostics.call('MISSING_FUTURES_DEPTH', virtual.checked_book, future_book)
     asks, spot_bids = spot_book
     future_asks, bids = future_book
     if not asks or not bids:
         return None
+    diagnostics.mark('MISSING_EXECUTABLE_PRICE')
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
     if not spot_ask or not perp_bid or spot_ask <= 0 or perp_bid <= 0:
         return None
-    rules = api.spot_rules(spot_exchange, symbol, 'buy')
+    rules = diagnostics.call('MISSING_SPOT_MARKET_PARAMS', api.spot_rules, spot_exchange, symbol, 'buy')
     # Step expresses allowed quantity precision; Futures size is rounded down by it.
+    diagnostics.mark('MISSING_SPOT_MARKET_PARAMS')
     required=[meta.get('min_qty'),meta.get('step'),meta.get('min_notional'),rules.get('min_qty'),rules.get('min_quote'),rules.get('step')] if rules else []
     if len(required)!=6 or any(v is None or not Decimal(str(v)).is_finite() or Decimal(str(v))<0 for v in required) or meta['step']<=0 or rules['step']<=0:
-        raise ValueError('Mandatory minimum order / quantity precision unavailable')
+        exc = ValueError('Mandatory minimum order / quantity precision unavailable')
+        fields = [(meta, 'min_qty', 'MISSING_MIN_QTY'), (meta, 'step', 'MISSING_STEP_SIZE'), (meta, 'min_notional', 'MISSING_MIN_NOTIONAL'), (rules or {}, 'min_qty', 'MISSING_MIN_QTY'), (rules or {}, 'step', 'MISSING_STEP_SIZE'), (rules or {}, 'min_quote', 'MISSING_MIN_NOTIONAL')]
+        exc.missing_mandatory_data = [label for row,key,label in fields if row.get(key) is None]
+        raise exc
     if rules['min_quote']>LEG_USDT or meta['min_notional']>LEG_USDT or meta['min_qty']*perp_bid>LEG_USDT or rules['min_qty']*spot_ask>LEG_USDT:
         import entry_policy
         entry_policy.reject('REJECTED_MIN_ORDER_ABOVE_TARGET',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
         logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; required exchange minimum exceeds target',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
+    diagnostics.mark('MISSING_EXECUTABLE_PRICE')
     quantity = down(min(LEG_USDT * (1 - buy_fee) / spot_ask,
                         LEG_USDT / perp_bid), meta['step'])
     if quantity <= 0 or quantity < meta['min_qty']:
@@ -269,10 +290,10 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     if category is None:
         return None
     try:
-        funding, next_funding = fresh_funding(api, future_exchange, symbol)
+        funding, next_funding = diagnostics.call('MISSING_FUNDING', fresh_funding, api, future_exchange, symbol)
     except Exception as exc:
         import entry_policy
-        entry_policy.reject('REJECTED_UNKNOWN_FUNDING',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
+        entry_policy.reject('REJECTED_UNKNOWN_FUNDING',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange,'missing_mandatory_data':diagnostics.classify(exc)})
         exc.entry_rejection_counted=True
         raise
     now = time.time()
@@ -282,9 +303,11 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     price = spot_ask
     # Model convergence to the current Spot reference; use actual exit-side
     # depth impact as a floor, in addition to the existing exit reserve.
+    diagnostics.mark('MISSING_SPOT_DEPTH' if not spot_bids else 'MISSING_FUTURES_DEPTH')
     if not spot_bids or not future_asks:raise ValueError('Exit depth unavailable')
     exit_sale=api.sell_for_usdt(spot_bids,quantity)
     exit_cover=spot_cost(future_asks,quantity,api)
+    diagnostics.mark('MISSING_SPOT_DEPTH' if exit_sale is None else 'MISSING_FUTURES_DEPTH')
     if exit_sale is None or exit_cover is None:raise ValueError('Exit depth unavailable')
     spot_exit_slip=max(EXIT_SLIPPAGE,1-exit_sale/(quantity*api.dec(spot_bids[0][0])))
     future_exit_slip=max(EXIT_SLIPPAGE,exit_cover/(quantity*api.dec(future_asks[0][0]))-1)
@@ -296,7 +319,9 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     projected = spot_exit + short_proceeds - cover - cost - open_fee - close_fee - funding_debit - price_buffer
     pct = projected / cost * 100
     if time.time() - sampled_from > 30:
-        raise ValueError('Entry quotes expired')
+        exc = ValueError('Entry quotes expired')
+        exc.missing_mandatory_data = ['STALE_SPOT_DATA','STALE_FUTURES_DATA']
+        raise exc
     return {'entry_policy': 'positive_net_v1', 'verified_at': sampled_from, 'symbol': symbol, 'spot': spot_exchange, 'future': future_exchange,
             'category': category, 'raw_spread_pct': raw_spread,
             'executable_spread_pct': executable_spread,
@@ -317,6 +342,14 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
 
 
 def scan(api):
+    token = diagnostics.begin()
+    try:
+        return _scan(api)
+    finally:
+        diagnostics.CYCLE.reset(token)
+
+
+def _scan(api):
     if not paper.storage_ready():
         logging.info('basis scan: candidates=0, conditional alerts=0 (storage unavailable)')
         return []  # Never alert without durable episode/checkpoint records.
@@ -336,6 +369,8 @@ def scan(api):
                       ('Gate', 'Binance', spots[1], futures[0])]
     available_directions = [(x[0], x[1]) for x in directions if x[2] and x[3]]
     logging.info('basis directions: active_directions=%s directions=%s', len(available_directions), available_directions)
+    for spot, future in available_directions:
+        diagnostics.CYCLE.get()['directions'].setdefault(spot+'->'+future, diagnostics.Counter())
     shortlist = []
     for spot_name, future_name, spot_rows, perp_rows in directions:
         for symbol in spot_rows.keys() & perp_rows.keys():
@@ -350,6 +385,7 @@ def scan(api):
                                             and (x[0] < 0) == negative),
                                            reverse=True)[:MAX_BASIS_CANDIDATES]), reverse=True)
     logging.info('MEXC scan: mexc_candidates=%s', sum('MEXC' in x[2:4] for x in shortlist))
+    diagnostics.candidates(shortlist)
     found = []
     for _, symbol, spot, future, funding in shortlist:
         if time.time() < api_blocked_until.get(future, 0):
@@ -375,7 +411,7 @@ def scan(api):
                 api_blocked_until[future] = time.time() + delay
             import entry_policy
             if not getattr(exc,'entry_rejection_counted',False):
-                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future})
+                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future,'raw_spread_pct':_ * 100,'missing_mandatory_data':diagnostics.classify(exc)})
             logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
                             future, type(exc).__name__, status or '-',
                             (getattr(response, 'url', '') or '').split('?')[0])
@@ -414,6 +450,7 @@ def scan(api):
             logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
                             type(exc).__name__)
     logging.info('basis scan: candidates=%s, conditional alerts=%s',len(shortlist),dispatched)
+    diagnostics.completed(len(shortlist), dispatched)
     return found
 
 
