@@ -1,4 +1,5 @@
 """Official MEXC GET-only market/personal-fee adapter. PAPER/VIRTUAL only."""
+import json
 import hashlib
 import hmac
 import logging
@@ -168,7 +169,46 @@ class Client:
         if not -5<=age<=30: raise MEXCUnavailable('MEXC stale snapshot')
 
     def spot_rules(self,symbol,side='buy'):
-        r=self.spot_symbols().get(symbol)
+        r = None
+        try:
+            r = self.spot_symbols().get(symbol)
+            return self._spot_rules(symbol, side, r)
+        except Exception as exc:
+            labels = getattr(exc, 'missing_mandatory_data', [])
+            if 'MISSING_MIN_QTY' in labels or str(exc) == 'MEXC spot side unavailable':
+                self.spot_metadata_snapshot(symbol, r, 'MISSING_MIN_QTY' if 'MISSING_MIN_QTY' in labels else 'MISSING_SPOT_MARKET_PARAMS')
+            raise
+
+    @staticmethod
+    def spot_metadata_snapshot(symbol, row, reject_reason):
+        cycle = diagnostics.CYCLE.get()
+        if cycle is None: return
+        seen = cycle.setdefault('mexc_spot_snapshot_symbols', set())
+        if symbol in seen: return
+        seen.add(symbol)
+        row = row if isinstance(row, dict) else {}
+        raw = row.get('baseSizePrecision')
+        present = 'baseSizePrecision' in row
+        parsed = diagnostics.numeric(raw)
+        try:
+            number(raw, strict=True)
+            result = 'ACCEPTED'
+        except MEXCUnavailable:
+            cause = 'FIELD_ABSENT' if not present else 'FIELD_NULL' if raw is None else 'FIELD_EMPTY' if raw == '' else 'FIELD_ZERO' if parsed != 'UNKNOWN' and Decimal(parsed) == 0 else 'FIELD_INVALID'
+            result = 'REJECTED_' + cause
+        def public_value(key):
+            if key not in row: return 'UNKNOWN'
+            value = row[key]
+            if value is None or type(value) in (bool, int): return value
+            if type(value) is float: return diagnostics.numeric(value)
+            if isinstance(value, str) and len(value) <= 64 and (re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?',value) or value in ('','ENABLED','DISABLED','NaN','Infinity','-Infinity')): return value
+            return 'INVALID_FORMAT_REDACTED'
+        fields = ('status','isSpotTradingAllowed','tradeSideType','baseAssetPrecision','baseSizePrecision','quoteAmountPrecision','quoteAmountPrecisionMarket')
+        snapshot = {key:public_value(key) for key in fields}
+        snapshot.update(symbol=diagnostics.safe(symbol), raw_type_baseSizePrecision=type(raw).__name__ if present else 'MISSING', parsed_baseSizePrecision=parsed, min_qty_validation_result=result, reject_reason=reject_reason)
+        logging.info('MEXC Spot metadata diagnostic: %s', json.dumps(snapshot,sort_keys=True))
+
+    def _spot_rules(self,symbol,side,r):
         if not r or r.get('tradeSideType') not in ('1',1,'2' if side=='buy' else '3'):
             raise MEXCUnavailable('MEXC spot side unavailable')
         precision=r.get('baseAssetPrecision')
