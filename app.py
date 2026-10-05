@@ -148,6 +148,7 @@ def _get_json(url, **kwargs):
         block_key = host_key if response.status_code in (418, 429) else path_key
         api_blocked_until[block_key] = time.monotonic() + delay
         if host_key in binance_io.HOSTS and response.status_code in (418, 429):
+            binance_io.spot_error_observed(host_key, parsed.path, response, kwargs.get('params'), delay)
             load = binance_io.rolling_load()
             observed = binance_io.weight_headers.get(host_key, {})
             logging.warning('Binance limit outcome: endpoint_that_triggered_limit=%s '

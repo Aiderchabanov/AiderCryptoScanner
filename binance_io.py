@@ -1,6 +1,8 @@
 """Shared Binance GET pacing and short-lived public snapshots; no trading APIs."""
 import copy
 import functools
+import json
+import sys
 import logging
 import math
 import re
@@ -15,6 +17,8 @@ local = threading.local()
 next_request = 0.0
 snapshots = {}
 request_history = deque()
+diagnostic_requests = deque()
+spot_error_diagnostics = deque(maxlen=100)
 weight_headers = {}
 server_weights = {}
 weight_limits = {}
@@ -125,6 +129,12 @@ def request_started(host, path, params):
         request_history.clear()
     request_history.append((now, host, path, weight(path, params)))
     snapshot = rolling_load(now)
+    record = request_fields(host, path, params)
+    record.update(timestamp=utc_timestamp(), estimated_weight=weight(path, params))
+    while diagnostic_requests and diagnostic_requests[0][0] <= now - 60:
+        diagnostic_requests.popleft()
+    diagnostic_requests.append((now, record))
+    logging.info('Binance REST request sent: %s', json.dumps({**record, **endpoint_load(host, path, now), **split_counters(now)}, sort_keys=True))
     if now - last_report >= 60:
         logging.info('Binance REST rolling load: requests_last_60s=%s estimated_weight_last_60s=%s',
                      snapshot['requests'], snapshot['estimated_weight'])
@@ -213,3 +223,107 @@ def remember(host, path, params, result):
     if cache_key is not None:
         deadline = getattr(local, 'started', time.monotonic()) + PUBLIC_TTL
         snapshots[cache_key] = deadline, copy.deepcopy(result)
+
+
+# Diagnostic-only helpers: never alter pacing, weights, cache or cooldown.
+def utc_timestamp(at=None):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() if at is None else at))
+
+
+def request_component():
+    frame = sys._getframe(1)
+    fallback = 'UNKNOWN'
+    try:
+        for _ in range(32):
+            if frame is None:
+                break
+            module = frame.f_globals.get('__name__', '').split('.')[-1]
+            name = frame.f_code.co_name
+            if module == 'risk_monitor':
+                return 'risk_monitor'
+            if module == 'paper' and name == 'poll':
+                return 'checkpoint'
+            if module == 'basis' and name == 'scan':
+                return 'scanner'
+            if module == 'virtual':
+                if name == 'observe': return 'observation_recovery'
+                if name == 'funding_warnings': return 'funding_warning'
+                if name in ('preview', 'confirm', 'menu', 'status'): return 'telegram_read_only'
+                fallback = 'virtual_quote'
+            if module == 'app' and name == 'basis_loop': return 'scanner'
+            frame = frame.f_back
+        return fallback
+    finally:
+        del frame
+
+
+def request_fields(host, path, params):
+    params = params if isinstance(params, dict) else {}
+    symbol = params.get('symbol')
+    limit = params.get('limit')
+    return {'host': host if host in HOSTS else 'UNKNOWN',
+            'endpoint': path if re.fullmatch(r'/(?:api|fapi|sapi)/v[0-9]+/[A-Za-z/]+', path) else 'UNKNOWN',
+            'component': request_component(),
+            'symbol': symbol if isinstance(symbol, str) and re.fullmatch(r'[A-Z0-9]{1,32}', symbol) else 'UNKNOWN',
+            'limit': int(limit) if not isinstance(limit, bool) and re.fullmatch(r'[0-9]{1,5}', str(limit)) else 'UNKNOWN'}
+
+
+def endpoint_load(host, path, now=None):
+    rolling_load(now)
+    rows = [r for r in request_history if r[1] == host]
+    return {'requests_last_60s_for_host': len(rows),
+            'requests_last_60s_for_endpoint': sum(r[2] == path for r in rows),
+            'estimated_weight_last_60s_for_host': sum(r[3] for r in rows)}
+
+
+def split_counters(now=None):
+    rolling_load(now)
+    spot = [r for r in request_history if r[1] == 'api.binance.com']
+    futures = [r for r in request_history if r[1] == 'fapi.binance.com']
+    depth = sum(r[2] == '/api/v3/depth' for r in spot)
+    info = sum(r[2] == '/api/v3/exchangeInfo' for r in spot)
+    return {'spot_requests_last_60s': len(spot), 'spot_depth_requests_last_60s': depth,
+            'spot_exchange_info_requests_last_60s': info, 'spot_other_requests_last_60s': len(spot)-depth-info,
+            'futures_requests_last_60s': len(futures),
+            'futures_depth_requests_last_60s': sum(r[2] == '/fapi/v1/depth' for r in futures),
+            'futures_funding_requests_last_60s': sum(r[2] in ('/fapi/v1/premiumIndex', '/fapi/v1/fundingRate', '/fapi/v1/fundingInfo') for r in futures),
+            'futures_commission_requests_last_60s': sum(r[2] == '/fapi/v1/commissionRate' for r in futures)}
+
+
+def sanitized_error(response):
+    # Only recognize fixed Binance messages/templates; arbitrary text may echo secrets.
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = None
+    if not isinstance(payload, dict): return 'UNKNOWN', 'UNKNOWN'
+    code = payload.get('code')
+    code = code if isinstance(code, int) and not isinstance(code, bool) and abs(code) < 10**9 else 'UNKNOWN'
+    msg = payload.get('msg')
+    if not isinstance(msg, str) or not msg: return code, 'UNKNOWN'
+    if msg in ('Too many requests.', 'Too many requests', 'Way too much request weight used; IP banned.', 'Invalid API-key, IP, or permissions for action.'):
+        return code, msg
+    if code == -1003:
+        banned = re.search(r'banned until ([0-9]{10,16})(?:[ .]|$)', msg)
+        if banned: return code, 'Too many requests; IP [REDACTED] banned until ' + banned.group(1)
+        if 'Too much request weight used' in msg or 'Too many requests' in msg:
+            return code, 'Too many requests / request weight limit (variable details redacted)'
+    return code, 'REDACTED_UNRECOGNIZED_MESSAGE'
+
+
+def spot_error_observed(host, path, response, params, delay):
+    if host != 'api.binance.com' or response.status_code not in (418, 429): return
+    code, message = sanitized_error(response)
+    numeric = []
+    for name, value in response.headers.items():
+        if name.lower() in ('x-mbx-used-weight', 'x-mbx-used-weight-1m', 'x-mbx-used-weight-60s') and isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 12:
+            numeric.append(int(value))
+    retry = parse_retry_after(response.headers.get('Retry-After'))
+    record = {**request_fields(host, path, params), **endpoint_load(host, path), **split_counters(),
+              'timestamp': utc_timestamp(), 'http_status': response.status_code,
+              'binance_code': code, 'sanitized_binance_msg': message,
+              'Retry-After': retry if retry is not None else 'UNKNOWN',
+              'server_used_weight': max(numeric) if numeric else 'UNKNOWN',
+              'cooldown_until': utc_timestamp(time.time() + delay)}
+    spot_error_diagnostics.append(record)
+    logging.warning('Binance Spot error diagnostic: %s', json.dumps(record, sort_keys=True))
