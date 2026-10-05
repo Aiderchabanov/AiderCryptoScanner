@@ -209,6 +209,11 @@ def quote(api, episode):
             'slippage':slippage, 'at':time.time(), 'spread':str(spread), 'spot_bid':str(spot_bids[0][0]),
             'spot_ask':str(spot_asks[0][0]),'futures_bid':str(future_bids[0][0]),
             'spot_entry_vwap_now':str(spot_buy/qty),'future_entry_vwap_now':str(short/qty),
+            # Diagnostic only: use the book already fetched, never another GET.
+            'spot_depth_usdt':str(sum((p*q for p,q in spot_asks),D(0))),
+            'futures_depth_usdt':str(sum((p*q for p,q in future_bids),D(0))),
+            'spot_depth_quantity':str(sum((q for p,q in spot_asks),D(0))),
+            'futures_depth_quantity':str(sum((q for p,q in future_bids),D(0))),
             'raw_spread':str((future_bids[0][0]/spot_asks[0][0]-1)*100),
             'futures_ask':str(future_asks[0][0]), 'spot_exit':str(spot_sale/qty),
             'future_exit':str(cover/qty), 'fees':str(fees), 'trading_net':str(trading_net),
@@ -331,6 +336,51 @@ def close_db(db, e, q):
 
 
 
+def spike_snapshot(db, e, q, funding):
+    """Retain a strong spike from existing observations only; no API access."""
+    entry=number(e['executable_spread_pct'])
+    expansion=number(q['spread'])-entry
+    if expansion < D(5):
+        return
+    def optional_number(key):
+        try:
+            return number(q[key]) if q.get(key) is not None else None
+        except (ValueError,TypeError,ArithmeticError):
+            return None
+    def age_flag(key):
+        age=optional_number(key)
+        return 'unknown' if age is None else age>D(30000) or age<D(-5000)
+    def depth_flag(key):
+        depth=optional_number(key)
+        return 'unknown' if depth is None else depth<number(e['quantity'],True)
+    difference=optional_number('quote_time_difference_ms')
+    fresh=0 <= time.time()-funding.get('at',0) <=30 and funding.get('next_at',0)>time.time()
+    data={'timestamp':q['at'],'episode_id':e['episode_id'],'symbol':e['symbol'],
+          'spot_exchange':e['spot_exchange'],'futures_exchange':e['futures_exchange'],
+          'entry_spread':str(entry),'current_spread':q['spread'],'expansion':str(expansion),
+          'spot_best_ask':q.get('spot_ask'),'spot_executable_avg':q.get('spot_entry_vwap_now'),
+          'spot_depth_usdt':q.get('spot_depth_usdt'),
+          'futures_best_bid':q.get('futures_bid'),'futures_executable_avg':q.get('future_entry_vwap_now'),
+          'futures_depth_usdt':q.get('futures_depth_usdt'),
+          'spot_quote_age_ms':q.get('spot_quote_age_ms'),
+          'futures_quote_age_ms':q.get('futures_quote_age_ms'),
+          'quote_time_difference_ms':str(difference) if difference is not None else None,
+          'trading_net_pnl':q.get('trading_net'),
+          'funding':funding.get('rate') if fresh else None,
+          'funding_settlement_status':q.get('funding_status','UNKNOWN_SETTLEMENT_PNL'),
+          'stale_spot_quote':age_flag('spot_quote_age_ms'),
+          'stale_futures_quote':age_flag('futures_quote_age_ms'),
+          'quote_time_mismatch':'unknown' if difference is None else abs(difference)>D(30000),
+          'thin_spot_depth':depth_flag('spot_depth_quantity'),
+          'thin_futures_depth':depth_flag('futures_depth_quantity'),
+          'depth_flag_basis':'observed entry-side quantity below episode quantity; not a general liquidity assessment',
+          'quote_time_mismatch_threshold_ms':30000}
+    result=db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',
+                      (f"spike_snapshot:{e['episode_id']}:{q['at']}",json.dumps(data)))
+    if result.rowcount:
+        logging.info('Virtual spike diagnostic saved: episode #%s symbol=%s expansion=%s p.p.; reused existing quote; no additional API request',e['episode_id'],e['symbol'],expansion)
+
+
 def risk_alert(db, e, q):
     """Observe only: reuse fresh executable quote, persist crossing/rearm state."""
     if not 0 <= time.time()-q['at'] <= 30:
@@ -349,7 +399,12 @@ def risk_alert(db, e, q):
     spread=number(q['spread'])
     expansion=spread-entry
     spread_level=max(0,int(expansion))  # Positive widening in percentage points.
-    crossed_spread=list(range(state['spread_expansion_level']+1,spread_level+1))
+    # Migrate existing state as already notified; no schema change or replay.
+    spread_notified=set(state.get('spread_notified',range(1,state['spread_expansion_level']+1)))
+    spread_notified={level for level in spread_notified if expansion>=D(level)-D('0.5')}
+    crossed_spread=[level for level in range(1,spread_level+1) if level not in spread_notified]
+    spread_notified.update(crossed_spread)
+    state['spread_notified']=sorted(spread_notified)
     thresholds=(D('-.20'),D('-.50'),D('-1.00'))
     net=number(q['net_pnl']) if q.get('net_pnl') is not None else None
     # Migrate existing levels as already notified; restart cannot reintroduce them.
@@ -375,10 +430,12 @@ def risk_alert(db, e, q):
         new_events.append(('spread',crossed_spread))
     if new_pnl:
         new_events.append(('pnl',new_pnl))
-    if new_events:
-        state['generation']+=1
+    if new_events or expansion>=D(5):
         live=db.execute('SELECT value FROM virtual_meta WHERE name=?',(f'funding_live:{ident}',)).fetchone()
         funding=json.loads(live['value']) if live else {}
+        spike_snapshot(db,e,q,funding)
+    if new_events:
+        state['generation']+=1
         fresh=0 <= time.time()-funding.get('at',0) <= 30 and funding.get('next_at',0)>time.time()
         funding_text=f"{number(funding['rate'])*100:+.4f}%" if fresh else 'UNKNOWN (fresh funding unavailable)'
         remaining=int(funding['next_at']-time.time()) if fresh else None

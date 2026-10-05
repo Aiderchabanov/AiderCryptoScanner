@@ -39,7 +39,7 @@ class VirtualRiskTests(unittest.TestCase):
         self.assertIn('Time to next funding:',body)
         self.observe(spread='2.9');virtual.bootstrap(self.path);self.observe(spread='2.9')
         self.assertEqual(self.api.telegram.call_count,1)
-        self.observe(spread='2.7');self.observe(spread='2.8')
+        self.observe(spread='2.2');self.observe(spread='2.8') # Recovery below +0.5 p.p.
         self.assertEqual(self.api.telegram.call_count,2)
         self.assertEqual(len(virtual.rows(self.path)),1) # No additional entry.
 
@@ -143,6 +143,91 @@ class VirtualRiskTests(unittest.TestCase):
         self.api.telegram.side_effect=RuntimeError('delivery uncertain')
         self.observe(net='-.20');virtual.bootstrap(self.path);self.observe(net='-.25')
         self.assertEqual(self.api.telegram.call_count,1)
+
+    def risk_cycle(self, expansion):
+        e=virtual.load(self.ident,self.path)
+        q=self.quote(str(virtual.D(e['executable_spread_pct'])+virtual.D(expansion)))
+        with paper.session(self.path) as db: virtual.risk_alert(db,e,q)
+        return q
+
+    def risk_bodies(self):
+        with paper.session(self.path) as db:
+            return [r['body'] for r in db.execute("SELECT body FROM virtual_events WHERE event_key LIKE 'risk:%' ORDER BY event_key").fetchall()]
+
+    def test_hysteresis_101_099_101_no_repeat(self):
+        for x in ('1.01','.99','1.01'):self.risk_cycle(x)
+        self.assertEqual(len(self.risk_bodies()),1)
+        self.assertEqual(self.levels()['spread_notified'],[1])
+
+    def test_hysteresis_101_040_105_rearms(self):
+        for x in ('1.01','.40','1.05'):self.risk_cycle(x)
+        self.assertEqual(len(self.risk_bodies()),2)
+
+    def test_hysteresis_210_180_205_no_repeat(self):
+        for x in ('2.10','1.80','2.05'):self.risk_cycle(x)
+        self.assertEqual(len(self.risk_bodies()),1)
+        self.assertEqual(self.levels()['spread_notified'],[1,2])
+
+    def test_hysteresis_210_140_205_only_level_2_rearms(self):
+        for x in ('2.10','1.40','2.05'):self.risk_cycle(x)
+        bodies=self.risk_bodies();self.assertEqual(len(bodies),2)
+        self.assertIn('SPREAD EXPANDED: +2.0 p.p.',bodies[-1])
+        self.assertNotIn('+1.0 p.p.',bodies[-1])
+        self.assertNotIn('NET P&L crossed:',bodies[-1])
+
+    def test_hysteresis_exact_boundary_restart_and_legacy_migration(self):
+        with paper.session(self.path) as db:
+            db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?)',
+                       (f'risk_levels:{self.ident}',json.dumps({'pnl_warning_level':0,'spread_expansion_level':2,'generation':1})))
+        self.risk_cycle('1.50');virtual.bootstrap(self.path);self.risk_cycle('2.05')
+        self.assertEqual(len(self.risk_bodies()),0)
+        self.risk_cycle('1.49');self.risk_cycle('2.05')
+        self.assertEqual(len(self.risk_bodies()),1)
+        self.assertNotIn('+1.0 p.p.',self.risk_bodies()[-1])
+
+    def test_spike_snapshot_existing_quote_no_api_and_unknowns_not_zero(self):
+        e=virtual.load(self.ident,self.path)
+        q=virtual.quote(self.api,e) # Existing normal observation supplies the book.
+        q['spread']='7.0';q['funding_status']='UNKNOWN_SETTLEMENT_PNL';q['net_pnl']=None
+        self.api.reset_mock();self.future.reset_mock();self.funding.reset_mock()
+        with paper.session(self.path) as db:
+            virtual.risk_alert(db,e,q)
+            row=db.execute("SELECT value FROM virtual_meta WHERE name LIKE 'spike_snapshot:%'").fetchone()
+            data=json.loads(row['value'])
+            self.assertEqual(data['spot_best_ask'],'10.01')
+            self.assertEqual(data['spot_executable_avg'],q['spot_entry_vwap_now'])
+            self.assertEqual(data['spot_depth_usdt'],'1001.00')
+            self.assertEqual(data['futures_depth_usdt'],'1010.0')
+            self.assertIsNone(data['spot_quote_age_ms'])
+            self.assertEqual(data['stale_spot_quote'],'unknown')
+            self.assertEqual(data['quote_time_mismatch'],'unknown')
+            self.assertFalse(data['thin_spot_depth'])
+            self.assertEqual(data['funding_settlement_status'],'UNKNOWN_SETTLEMENT_PNL')
+            self.assertEqual(data['trading_net_pnl'],q['trading_net'])
+            self.assertIsNone(data['funding'])
+            virtual.risk_alert(db,e,q) # Same quote never duplicates the snapshot.
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_meta WHERE name LIKE 'spike_snapshot:%'").fetchone()[0],1)
+        self.api.orderbook.assert_not_called();self.api.fee.assert_not_called()
+        self.future.assert_not_called();self.funding.assert_not_called()
+
+    def test_no_spike_snapshot_below_5_and_quality_flags_from_known_values(self):
+        self.risk_cycle('4.99')
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_meta WHERE name LIKE 'spike_snapshot:%'").fetchone()[0],0)
+            e=virtual.load(self.ident,self.path);q=self.quote('6.8')
+            q.update(spot_quote_age_ms=31000,futures_quote_age_ms=100,
+                     quote_time_difference_ms=30900,spot_depth_quantity='1')
+            virtual.risk_alert(db,e,q)
+            data=json.loads(db.execute("SELECT value FROM virtual_meta WHERE name LIKE 'spike_snapshot:%'").fetchone()['value'])
+            self.assertTrue(data['stale_spot_quote']);self.assertFalse(data['stale_futures_quote'])
+            self.assertTrue(data['quote_time_mismatch']);self.assertTrue(data['thin_spot_depth'])
+            self.assertEqual(data['thin_futures_depth'],'unknown')
+
+    def test_continuing_spike_retains_new_snapshot_without_repeating_alert(self):
+        self.risk_cycle('5.00');self.risk_cycle('5.25')
+        self.assertEqual(len(self.risk_bodies()),1)
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_meta WHERE name LIKE 'spike_snapshot:%'").fetchone()[0],2)
 
 
 if __name__=='__main__':unittest.main()
