@@ -55,6 +55,8 @@ def futures_markets(api):
 
 
 def futures_meta(api, exchange, symbol):
+    if exchange == 'MEXC':
+        return api.mexc.futures_meta(symbol)
     if exchange == 'BingX':
         return api.bingx.futures_meta(symbol)
     if exchange == 'Gate':
@@ -109,6 +111,8 @@ def spot_minimum(api, exchange, symbol):
 
 
 def futures_fee(api, exchange, symbol):
+    if exchange == 'MEXC':
+        return api.mexc.fee(symbol, futures=True)
     if exchange == 'BingX':
         return api.bingx.fee(symbol, futures=True)
     def load():
@@ -134,6 +138,8 @@ def futures_fee(api, exchange, symbol):
 
 
 def futures_book(api, exchange, symbol, multiplier):
+    if exchange == 'MEXC':
+        return api.mexc.orderbook(symbol, futures=True)
     if exchange == 'BingX':
         return api.bingx.orderbook(symbol, futures=True)
     if exchange == 'Binance':
@@ -172,6 +178,8 @@ def funding_expense(rate, direction, notional, crosses):
 
 def fresh_funding(api, exchange, symbol):
     """Fetch the contract's funding independently of cached market metadata."""
+    if exchange == 'MEXC':
+        return api.mexc.fresh_funding(symbol)
     if exchange == 'BingX':
         return api.bingx.fresh_funding(symbol)
     if exchange == 'Binance':
@@ -326,6 +334,8 @@ def scan(api):
         futures = futures_markets(api)
         directions = [('Binance', 'Gate', spots[0], futures[1]),
                       ('Gate', 'Binance', spots[1], futures[0])]
+    available_directions = [(x[0], x[1]) for x in directions if x[2] and x[3]]
+    logging.info('basis directions: active_directions=%s directions=%s', len(available_directions), available_directions)
     shortlist = []
     for spot_name, future_name, spot_rows, perp_rows in directions:
         for symbol in spot_rows.keys() & perp_rows.keys():
@@ -339,6 +349,7 @@ def scan(api):
                         for item in sorted((x for x in shortlist if x[2:4] == direction
                                             and (x[0] < 0) == negative),
                                            reverse=True)[:MAX_BASIS_CANDIDATES]), reverse=True)
+    logging.info('MEXC scan: mexc_candidates=%s', sum('MEXC' in x[2:4] for x in shortlist))
     found = []
     for _, symbol, spot, future, funding in shortlist:
         if time.time() < api_blocked_until.get(future, 0):

@@ -632,6 +632,7 @@ def current_scanner_api():
 
 
 def basis_loop():
+    current_scanner_api().mexc.probe()
     if current_scanner_api().bingx.enabled:
         # One read-only probe shares the scanner's limiter; never records or alerts.
         import smoke_bingx

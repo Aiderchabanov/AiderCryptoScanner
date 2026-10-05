@@ -1,12 +1,14 @@
 """Routing adapter: legacy Binance/Gate implementations remain unchanged."""
 import logging
 import bingx
+import mexc
 
 
 class ScannerAPI:
     multi_exchange = True
 
-    def __init__(self, legacy, bingx_client=None):
+    def __init__(self, legacy, bingx_client=None, mexc_client=None):
+        self.mexc = mexc_client if mexc_client is not None else mexc.Client()
         self.legacy = legacy
         self.bingx = bingx_client if bingx_client is not None else bingx.Client()
 
@@ -14,22 +16,30 @@ class ScannerAPI:
         return getattr(self.legacy, name)
 
     def credentials_ready(self, name):
+        if name == 'MEXC':
+            return self.mexc.enabled and self.mexc.credentials_ready and any(self.mexc.auth.values())
         if name == 'BingX':
             return self.bingx.enabled and self.bingx.credentials_ready
         return bool(getattr(self.legacy, name.upper() + '_KEY', '')
                     and getattr(self.legacy, name.upper() + '_SECRET', ''))
 
     def orderbook(self, exchange, symbol):
+        if exchange == 'MEXC':
+            return self.mexc.orderbook(symbol)
         if exchange == 'BingX':
             return self.bingx.orderbook(symbol)
         return self.legacy.orderbook(exchange, symbol)
 
     def fee(self, exchange, symbol):
+        if exchange == 'MEXC':
+            return self.mexc.fee(symbol)
         if exchange == 'BingX':
             return self.bingx.fee(symbol)
         return self.legacy.fee(exchange, symbol)
 
     def spot_rules(self, exchange, symbol, side):
+        if exchange == 'MEXC':
+            return self.mexc.spot_rules(symbol, side)
         if exchange == 'BingX':
             return self.bingx.spot_rules(symbol, side)
         return self.legacy.spot_rules(exchange, symbol, side)
@@ -69,4 +79,10 @@ class ScannerAPI:
                 except Exception as exc:
                     logging.warning('BingX %s markets unavailable (%s)',
                                     'Futures' if market else 'Spot', type(exc).__name__)
+        if self.mexc.enabled and self.mexc.credentials_ready:
+            for target, market, name in ((spots, False, 'spot'), (futures, True, 'futures')):
+                if not self.mexc.auth[name]: continue
+                try: target['MEXC'] = self.mexc.tickers(futures=market)
+                except Exception as exc:
+                    logging.warning('MEXC %s markets unavailable (%s)', name, type(exc).__name__)
         return spots, futures
