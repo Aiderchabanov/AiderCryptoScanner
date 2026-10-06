@@ -449,8 +449,9 @@ def _scan(api):
                 found.append(item)
             elif item:
                 import entry_policy
-                diagnostics.flow('ENTRY_GATE_FAILED',item,reason=entry_policy.reason(item))
-                entry_policy.reject(entry_policy.reason(item),item)
+                rejection=entry_policy.reason(item)
+                diagnostics.flow('ENTRY_GATE_FAILED',item,reason=rejection)
+                entry_policy.reject(rejection,item)
         except Exception as exc:
             response = getattr(exc, 'response', None)
             status = getattr(response, 'status_code', None)
