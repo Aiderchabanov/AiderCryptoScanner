@@ -401,6 +401,7 @@ def risk_alert(db, e, q):
     spread_level=max(0,int(expansion))  # Positive widening in percentage points.
     # Migrate existing state as already notified; no schema change or replay.
     spread_notified=set(state.get('spread_notified',range(1,state['spread_expansion_level']+1)))
+    diagnostic_notified_before=tuple(spread_notified) if ident==22 else ()
     spread_notified={level for level in spread_notified if expansion>=D(level)-D('0.5')}
     crossed_spread=[level for level in range(1,spread_level+1) if level not in spread_notified]
     spread_notified.update(crossed_spread)
@@ -456,6 +457,9 @@ def risk_alert(db, e, q):
         event(db,f"risk:{ident}:{state['generation']}",ident,body)
         logging.info('Virtual risk alert queued: episode #%s; new_events=%s; pnl_warning_level=%s; spread_expansion_level=%s',ident,[(kind,[str(level) for level in levels]) for kind,levels in new_events],state['pnl_warning_level'],spread_level)
     db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(key,json.dumps(state)))
+    if ident==22:
+        import episode22_diagnostics
+        episode22_diagnostics.emit(e,q,'hysteresis',diagnostic_notified_before,spread_notified,crossed_spread)
 
 def observe(api, path=None):
     # Manual closure of a continuing gap must not create a fresh entry next scan.
@@ -484,6 +488,14 @@ def observe(api, path=None):
                 # Convergence is the same +/-0.10% band for every entry sign.
                 entry = D(e['executable_spread_pct'])
                 converged = abs(spread) <= paper.CLOSED_PCT
+                if e['episode_id']==22:
+                    import episode22_diagnostics
+                    diagnostic_funding=db.execute('SELECT value FROM virtual_meta WHERE name=?',('funding_live:22',)).fetchone()
+                    try:
+                        diagnostic_funding=json.loads(diagnostic_funding['value']) if diagnostic_funding else {}
+                    except (ValueError,TypeError):
+                        diagnostic_funding={}
+                    episode22_diagnostics.emit(e,q,'observation',funding=diagnostic_funding)
                 update_metrics(db,e,q,converged)
                 if converged:
                     if q['net_pnl'] is not None and number(q['net_pnl'])>=0:
