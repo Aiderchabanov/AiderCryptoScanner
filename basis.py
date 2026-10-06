@@ -358,10 +358,13 @@ def _scan(api):
         return []  # Never alert without durable episode/checkpoint records.
     if getattr(api, 'multi_exchange', False) is True:
         spots, futures = api.market_maps()
+        # Entry-role safety gate only. Keep MEXC adapters, market metadata,
+        # Futures venue and observation/recovery of existing episodes intact.
+        logging.info('MEXC_SPOT_ENTRY_ENABLED=false MEXC_SPOT_DISABLE_REASON=MEXC_SPOT_QUANTITY_RULES_UNCONFIRMED')
         directions = [(spot, future, spot_rows, perp_rows)
                       for spot, spot_rows in spots.items()
                       for future, perp_rows in futures.items()
-                      if spot != future and api.credentials_ready(spot) and api.credentials_ready(future)]
+                      if spot != 'MEXC' and spot != future and api.credentials_ready(spot) and api.credentials_ready(future)]
     else:
         if not all((api.BINANCE_KEY, api.BINANCE_SECRET, api.GATE_KEY, api.GATE_SECRET)):
             logging.info('basis scan: candidates=0, conditional alerts=0 (read-only credentials unavailable)')
