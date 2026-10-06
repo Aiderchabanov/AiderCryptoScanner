@@ -16,9 +16,13 @@ class MEXCSpotMinQtyTests(unittest.TestCase):
             if expected is None:
                 with self.assertRaises(mexc.MEXCUnavailable) as raised:
                     client.spot_rules('BOMEUSDT')
-                self.assertEqual(raised.exception.missing_mandatory_data, ['MISSING_MIN_QTY'])
+                self.assertIn('MISSING_MIN_QTY', raised.exception.missing_mandatory_data)
             else:
-                self.assertEqual(client.spot_rules('BOMEUSDT')['min_qty'], Decimal(expected))
+                # Parsing a positive minimum does not establish an increment.
+                self.assertEqual(mexc.number(value, strict=True), Decimal(expected))
+                with self.assertRaises(mexc.MEXCUnavailable) as raised:
+                    client.spot_rules('BOMEUSDT')
+                self.assertEqual(raised.exception.missing_mandatory_data, ['MISSING_STEP_SIZE'])
             get.assert_not_called()
 
     def test_numeric_string_fraction(self): self.check_value('0.01', '0.01')
@@ -37,4 +41,4 @@ class MEXCSpotMinQtyTests(unittest.TestCase):
         with patch.object(client,'spot_symbols',return_value={'BOMEUSDT':{'tradeSideType':1,'baseAssetPrecision':2}}):
             with self.assertRaises(mexc.MEXCUnavailable) as raised:
                 client.spot_rules('BOMEUSDT')
-            self.assertEqual(raised.exception.missing_mandatory_data,['MISSING_MIN_QTY'])
+            self.assertIn('MISSING_MIN_QTY',raised.exception.missing_mandatory_data)

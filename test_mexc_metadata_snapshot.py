@@ -11,7 +11,7 @@ class SnapshotTests(unittest.TestCase):
             with patch.object(c,'spot_symbols',return_value={'ABCUSDT':row}), self.assertLogs(level='INFO') as logs, patch.object(mexc.requests,'get') as get:
                 for _ in range(2):
                     with self.assertRaises(mexc.MEXCUnavailable) as raised:c.spot_rules('ABCUSDT')
-                    self.assertEqual(raised.exception.missing_mandatory_data,['MISSING_MIN_QTY'])
+                    self.assertIn('MISSING_MIN_QTY',raised.exception.missing_mandatory_data)
                 get.assert_not_called()
             self.assertEqual(len(logs.output),1)
             self.assertNotIn('SECRET',str(logs.output))
@@ -22,7 +22,8 @@ class SnapshotTests(unittest.TestCase):
         token=d.begin();c=mexc.Client()
         try:
             with patch.object(c,'spot_symbols',return_value={'ABCUSDT':{'tradeSideType':1,'baseAssetPrecision':2,'baseSizePrecision':'0.01','quoteAmountPrecision':'1'}}),patch.object(mexc.logging,'info') as log:
-                self.assertEqual(str(c.spot_rules('ABCUSDT')['min_qty']),'0.01');log.assert_not_called()
+                with self.assertRaises(mexc.MEXCUnavailable) as raised:c.spot_rules('ABCUSDT')
+                self.assertEqual(raised.exception.missing_mandatory_data,['MISSING_STEP_SIZE']);log.assert_not_called()
             with patch.object(c,'spot_symbols',return_value={'ABCUSDT':{'tradeSideType':1,'baseAssetPrecision':2,'baseSizePrecision':'0.01'}}),patch.object(mexc.logging,'info') as log:
                 with self.assertRaises(mexc.MEXCUnavailable):c.spot_rules('ABCUSDT')
                 log.assert_not_called()

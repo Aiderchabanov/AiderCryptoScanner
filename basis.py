@@ -257,6 +257,9 @@ def _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
         fields = [(meta, 'min_qty', 'MISSING_MIN_QTY'), (meta, 'step', 'MISSING_STEP_SIZE'), (meta, 'min_notional', 'MISSING_MIN_NOTIONAL'), (rules or {}, 'min_qty', 'MISSING_MIN_QTY'), (rules or {}, 'step', 'MISSING_STEP_SIZE'), (rules or {}, 'min_quote', 'MISSING_MIN_NOTIONAL')]
         exc.missing_mandatory_data = [label for row,key,label in fields if row.get(key) is None]
         raise exc
+    cycle = diagnostics.CYCLE.get()
+    if cycle is not None and 'MEXC' in (spot_exchange, future_exchange):
+        cycle['directions'].setdefault(spot_exchange+'->'+future_exchange, diagnostics.Counter())['symbols_fully_valid'] += 1
     if rules['min_quote']>LEG_USDT or meta['min_notional']>LEG_USDT or meta['min_qty']*perp_bid>LEG_USDT or rules['min_qty']*spot_ask>LEG_USDT:
         import entry_policy
         entry_policy.reject('REJECTED_MIN_ORDER_ABOVE_TARGET',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
@@ -371,6 +374,11 @@ def _scan(api):
     logging.info('basis directions: active_directions=%s directions=%s', len(available_directions), available_directions)
     for spot, future in available_directions:
         diagnostics.CYCLE.get()['directions'].setdefault(spot+'->'+future, diagnostics.Counter())
+    for spot, future, spot_rows, future_rows in directions:
+        if 'MEXC' in (spot, future):
+            counts = diagnostics.CYCLE.get()['directions'].setdefault(spot+'->'+future, diagnostics.Counter())
+            counts['scan_active'] = bool(spot_rows and future_rows)
+            counts['symbols_compared'] = len(spot_rows.keys() & future_rows.keys())
     shortlist = []
     for spot_name, future_name, spot_rows, perp_rows in directions:
         for symbol in spot_rows.keys() & perp_rows.keys():
@@ -411,7 +419,7 @@ def _scan(api):
                 api_blocked_until[future] = time.time() + delay
             import entry_policy
             if not getattr(exc,'entry_rejection_counted',False):
-                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future,'raw_spread_pct':_ * 100,'missing_mandatory_data':diagnostics.classify(exc)})
+                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future,'raw_spread_pct':_ * 100,'missing_mandatory_data':diagnostics.classify(exc),'mexc_spot_quantity_reasons':getattr(exc,'mexc_spot_quantity_reasons',[])})
             logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
                             future, type(exc).__name__, status or '-',
                             (getattr(response, 'url', '') or '').split('?')[0])
@@ -446,6 +454,9 @@ def _scan(api):
             api.telegram(format_alert(item) + '\n' + paper.history_line(None, item['symbol'], item.get('category', 'POSITIVE')))
             last_alert[key] = now
             dispatched+=1
+            cycle = diagnostics.CYCLE.get()
+            if cycle is not None:
+                cycle['directions'].setdefault(item['spot']+'->'+item['future'], diagnostics.Counter())['conditional_alerts'] += 1
         except Exception as exc:
             logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
                             type(exc).__name__)

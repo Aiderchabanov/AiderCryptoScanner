@@ -213,10 +213,35 @@ class Client:
             raise MEXCUnavailable('MEXC spot side unavailable')
         precision=r.get('baseAssetPrecision')
         if type(precision) is not int or not 0<=precision<=18: raise MEXCUnavailable('MEXC quantity precision UNKNOWN')
-        return {'step':Decimal(1).scaleb(-precision),'min_qty':diagnostics.call('MISSING_MIN_QTY', number, r.get('baseSizePrecision'), strict=True),
+        # No documented Spot increment source has been confirmed. Precision is
+        # not evidence of a quantity increment; do not synthesize 10**-precision.
+        quantity_rules = self.validate_spot_quantity_rules(r.get('baseSizePrecision'), None)
+        return {**quantity_rules,
                 'min_quote':diagnostics.call('MISSING_MIN_NOTIONAL', number, r.get('quoteAmountPrecision'), strict=True),
                 'max_qty':None,'max_quote':number(r['maxQuoteAmount'],strict=True) if r.get('maxQuoteAmount') is not None else None,
                 'market_max_qty':None,'market_max_quote':None}
+
+    @staticmethod
+    def validate_spot_quantity_rules(minimum, confirmed_increment):
+        """Validate values, never infer them. Production has no increment source.
+
+        confirmed_increment may only be supplied by a verified official source;
+        no new metadata field, environment fallback or per-symbol guess is used.
+        """
+        values, missing, reasons = {}, [], []
+        for key, value, category, reason in (
+            ('min_qty', minimum, 'MISSING_MIN_QTY', 'MEXC_SPOT_UNKNOWN_MIN_QTY'),
+            ('step', confirmed_increment, 'MISSING_STEP_SIZE', 'MEXC_SPOT_UNKNOWN_QUANTITY_INCREMENT'),
+        ):
+            try: values[key] = number(value, strict=True)
+            except MEXCUnavailable:
+                missing.append(category); reasons.append(reason)
+        if missing:
+            exc = MEXCUnavailable('MEXC Spot quantity rules UNKNOWN')
+            exc.missing_mandatory_data = missing
+            exc.mexc_spot_quantity_reasons = reasons
+            raise exc
+        return values
 
     def futures_meta(self,symbol):
         r=self.contracts().get(symbol)

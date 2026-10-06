@@ -74,6 +74,12 @@ def record(code, item):
                    futures_exchange=safe(item.get('future')), raw_spread_pct=numeric(item.get('raw_spread_pct')),
                    expected_net_pct=numeric(item.get('pct')), reject_reason=safe(code),
                    missing_mandatory_data=missing, diagnostic_scope='first_failure_no_extra_requests')
+        reasons = [x for x in item.get('mexc_spot_quantity_reasons', []) if x in
+                   ('MEXC_SPOT_UNKNOWN_MIN_QTY','MEXC_SPOT_UNKNOWN_QUANTITY_INCREMENT','MEXC_SPOT_UNKNOWN_QUANTITY_RULES')]
+        if item.get('spot') == 'MEXC' and reasons:
+            row['mexc_spot_quantity_reasons'] = reasons
+            counts['symbols_rejected_unknown_mexc_quantity'] += 1
+            cycle['counts']['symbols_rejected_unknown_mexc_quantity'] += 1
         logging.info('Entry mandatory diagnostic: %s', json.dumps(row, sort_keys=True))
         cycle['recent_missing'].append(row)
         cycle['recent_missing'] = cycle['recent_missing'][-10:]
@@ -91,13 +97,15 @@ def completed(candidate_count, alert_count):
     cycle = CYCLE.get()
     if cycle is None:
         return
-    keys = list(REJECTIONS.values()) + ['other_rejection'] + [x.lower() for x in CATEGORIES]
+    keys = list(REJECTIONS.values()) + ['other_rejection','symbols_rejected_unknown_mexc_quantity'] + [x.lower() for x in CATEGORIES]
     def full(counts):
         result = {key: counts[key] for key in keys}
         result['candidates'] = counts['candidates']
         result['missing_market_params'] = counts['missing_spot_market_params'] + counts['missing_futures_market_params']
         result['missing_depth'] = counts['missing_spot_depth'] + counts['missing_futures_depth']
         result['stale_data'] = counts['stale_spot_data'] + counts['stale_futures_data']
+        for key in ('scan_active','symbols_compared','symbols_fully_valid','conditional_alerts'):
+            if key in counts: result[key] = counts[key]
         return result
     total = full(cycle['counts'])
     total['candidates'] = candidate_count
