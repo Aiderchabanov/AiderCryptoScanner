@@ -57,10 +57,14 @@ def lock(db):
 
 
 def deposit():
-    value = D(os.getenv('PAPER_DEPOSIT_USDT', '500'))
+    value = D(os.getenv('PAPER_DEPOSIT_USDT', '1000'))
     if not value.is_finite() or value <= 0:
         raise ValueError('Invalid virtual deposit')
     return value
+
+
+def working_capital_limit():
+    return min(deposit() / 2, D(500))
 
 
 def number(value, positive=False):
@@ -137,7 +141,7 @@ def bootstrap(path=None):
                 if due>=time.time():
                     db.execute("INSERT INTO checkpoints (episode_id,horizon_min,due_at,status) VALUES (?,?,?,'pending') ON CONFLICT (episode_id,horizon_min) DO NOTHING",(e['id'],minute,due))
         recovered = [dict(r) for r in db.execute("SELECT episode_id,last_notice_spread,last_warning FROM virtual_state WHERE state='open' ORDER BY episode_id").fetchall()]
-        logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), min(deposit()/2, D(250)), recovered)
+        logging.info('Virtual recovery: %s open episodes; used capital %s / %s USDT; notification levels %s', len(recovered), used(db), working_capital_limit(), recovered)
 
     a=accounting(path)
     logging.info('Virtual accounting: confirmed_realized_pnl=%s; current_virtual_balance=%s; closed_complete=%s; closed_incomplete=%s; open=%s; used_capital=%s; complete_ids=%s; incomplete_ids=%s',a['confirmed_realized_pnl'],a['current_virtual_balance'],a['closed_complete'],a['incomplete_closed_pnl_count'],a['open_episodes'],a['used_capital'],a['closed_complete_ids'],a['closed_incomplete_ids'])
@@ -294,9 +298,9 @@ def accounting(path=None, api=None):
             unrealized+=number(q['net_pnl'])
         except Exception:
             unknown+=1
-    limit=min(deposit()/2,D(250))
+    limit=working_capital_limit()
     return {'confirmed_realized_pnl':confirmed,'cumulative_realized_pnl':confirmed,
-            'current_virtual_balance':D(500)+confirmed,'initial_virtual_deposit':D(500),
+            'current_virtual_balance':deposit()+confirmed,'initial_virtual_deposit':deposit(),
             'incomplete_closed_pnl_count':len(closed)-complete,'closed_complete':complete,
             'closed_complete_ids':complete_ids,'closed_incomplete_ids':incomplete_ids,
             'closed_complete_count':complete,'closed_incomplete_count':len(closed)-complete,
@@ -310,7 +314,7 @@ def status(api,chat_id,path=None):
     unrealized=(f"{a['unrealized_pnl_open']:+.2f} USDT" if a['unrealized_pnl_open'] is not None
                 else f"UNKNOWN ({a['unrealized_unknown_count']} incomplete; known subtotal {a['known_unrealized_subtotal']:+.2f} USDT)")
     api.telegram(
-        f"📊 VIRTUAL ACCOUNT — PAPER ONLY\nInitial deposit: 500.00 USDT\n"
+        f"📊 VIRTUAL ACCOUNT — PAPER ONLY\nInitial deposit: {a['initial_virtual_deposit']:.2f} USDT\n"
         f"Confirmed realized P&L: {a['confirmed_realized_pnl']:+.2f} USDT\n"
         f"Current virtual balance: {a['current_virtual_balance']:.2f} USDT\n"
         f"Unrealized P&L open: {unrealized}\nOpen episodes: {a['open_episodes']}\n"
@@ -709,7 +713,7 @@ def menu(api, action, chat_id,path=None):
             lines.append(f"#{e['episode_id']} {e['symbol']}: свежий P&L недоступен")
         buttons.append([{'text':f"#{e['episode_id']} {e['symbol']}",'callback_data':f"{action}:{e['episode_id']}"}])
     with paper.session(path) as db:
-        ensure(db); lines.append(f"Used capital {used(db):.4f} / {min(deposit()/2, D(250)):.2f} USDT (50 USDT на episode)")
+        ensure(db); lines.append(f"Used capital {used(db):.4f} / {working_capital_limit():.2f} USDT")
     api.telegram('\n'.join(lines) if entries else lines[0]+'\nОткрытых сделок нет.',chat_id,reply_markup={'inline_keyboard':buttons} if buttons else None)
 
 
@@ -730,7 +734,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
         item=verified_entry(api,e)
         with paper.session(path) as db:
             ensure(db)
-            if used(db)+capital(item['spot_cost'],item['future_notional']) > min(deposit()/2, D(250)):
+            if used(db)+capital(item['spot_cost'],item['future_notional']) > working_capital_limit():
                 raise ValueError('50% capital limit')
         q={'spread':str(item['executable_spread_pct']), 'spot_entry':str(item['spot_entry']), 'future_entry':str(item['future_entry']), 'funding':str(item['funding']), 'level':level}
         text=f"Размеры ног: {item['spot_cost']:.4f} / {item['future_notional']:.4f} USDT; комиссии Spot/Futures {item['spot_fee']*100:.4f}% / {item['future_fee']*100:.4f}%; модель net {item['pct']:+.4f}%; защитный резерв 0.20%.\nДополнительный VIRTUAL BUY Spot {q['spot_entry']} + SHORT Futures {q['future_entry']}; funding {D(q['funding'])*100:+.4f}%; spread {D(q['spread']):+.4f}%."

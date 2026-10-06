@@ -259,7 +259,7 @@ def _record(item, path=None, at=None, parent_id=None, connection=None):
                 entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='PAPER_BUDGET_INVALID')
                 return None
             addition = virtual.capital(item['spot_cost'],item['future_notional'])
-            if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
+            if virtual.used(db) + addition > virtual.working_capital_limit():
                 entry_policy.reject('REJECTED_MAX_DEPOSIT_LOAD',item,path,db)
                 entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='MAX_WORKING_CAPITAL')
                 return None

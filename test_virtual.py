@@ -133,9 +133,11 @@ class VirtualTests(unittest.TestCase):
         with paper.session(self.path) as db:
             self.assertEqual(virtual.used(db),D('201.8'))
             self.assertEqual(db.execute('SELECT parent_id FROM virtual_state ORDER BY episode_id DESC').fetchone()[0],self.ident)
-        self.assertIsNone(paper.record(dict(self.item,symbol='XYZUSDT'),self.path))
+        for symbol in ('XYZUSDT','XYZ2USDT'):
+            self.assertIsNotNone(paper.record(dict(self.item,symbol=symbol),self.path))
+        self.assertIsNone(paper.record(dict(self.item,symbol='XYZ3USDT'),self.path))
     def test_actual_capital_leverage_limits_release_and_restart(self):
-        for lev,count,per_episode in (('1',2,D(100)),('2',3,D(75)),('5',4,D(60))):
+        for lev,count,per_episode in (('1',5,D(100)),('2',6,D(75)),('5',8,D(60))):
             path=Path(self.tmp.name)/f'leverage{lev}.sqlite'
             item=dict(self.item,future_notional=D(50))
             with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':lev}):
@@ -158,9 +160,9 @@ class VirtualTests(unittest.TestCase):
         path=Path(self.tmp.name)/'six.sqlite'
         item=dict(self.item,spot_cost=D(40),future_notional=D(40))
         with patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':'25'}):
-            for n in range(6):self.assertIsNotNone(paper.record(dict(item,symbol=f'SMALL{n}USDT'),path))
-            with paper.session(path) as db:self.assertEqual(virtual.used(db),D('249.6'))
-            self.assertIsNone(paper.record(dict(item,symbol='SEVENTHUSDT'),path))
+            for n in range(12):self.assertIsNotNone(paper.record(dict(item,symbol=f'SMALL{n}USDT'),path))
+            with paper.session(path) as db:self.assertEqual(virtual.used(db),D('499.2'))
+            self.assertIsNone(paper.record(dict(item,symbol='THIRTEENTHUSDT'),path))
 
     def test_default_one_explicit_log_invalid_leverage_and_legacy_migration(self):
         with patch.dict('os.environ',{},clear=True),patch.object(virtual,'_leverage_logged',None),self.assertLogs(level='INFO') as logs:

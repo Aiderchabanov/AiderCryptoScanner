@@ -21,16 +21,16 @@ class TargetSizeTests(unittest.TestCase):
         for args in ({'min_spot':D(31)},{'min_future':D(31)},{'future_step':D(4)}):
             with self.assertLogs(level='INFO') as logs:self.assertIsNone(self.evaluate(**args))
             self.assertIn('REJECTED_MIN_ORDER_ABOVE_TARGET',' '.join(logs.output))
-    def test_four_full_pairs_fifth_blocked_actual_capital_and_target_saved(self):
+    def test_eight_full_pairs_ninth_blocked_actual_capital_and_target_saved(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict('os.environ',{'PAPER_FUTURES_LEVERAGE':'1'}):
             path=Path(tmp)/'isolated.sqlite'
             item=dict(example(),paper_budget_usdt=D(30),spot_cost=D(30),future_notional=D(30),quantity=D(3),executable_spread_pct=D('1.8'),raw_spread_pct=D(2),next_funding_at=time.time()+18000)
-            for n in range(4):self.assertIsNotNone(paper.record(dict(item,symbol=f'COIN{n}USDT'),path))
-            self.assertIsNone(paper.record(dict(item,symbol='FIFTHUSDT'),path))
+            for n in range(8):self.assertIsNotNone(paper.record(dict(item,symbol=f'COIN{n}USDT'),path))
+            self.assertIsNone(paper.record(dict(item,symbol='NINTHUSDT'),path))
             with paper.session(path) as db:
-                self.assertEqual(virtual.used(db),D(240))
+                self.assertEqual(virtual.used(db),D(480))
                 self.assertEqual(db.execute('SELECT target_usdt FROM episodes LIMIT 1').fetchone()[0],'30')
-                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0],36)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM checkpoints').fetchone()[0],72)
                 db.execute("UPDATE virtual_state SET state='closed' WHERE episode_id=1")
-                self.assertEqual(virtual.used(db),D(180))
-            self.assertIsNotNone(paper.record(dict(item,symbol='FIFTHUSDT'),path))
+                self.assertEqual(virtual.used(db),D(420))
+            self.assertIsNotNone(paper.record(dict(item,symbol='NINTHUSDT'),path))

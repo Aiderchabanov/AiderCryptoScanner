@@ -23,7 +23,7 @@ class AccountingTests(unittest.TestCase):
             self.ident=paper.record(self.item,self.path)
         before=virtual.accounting(self.path)
         self.assertEqual(before['cumulative_realized_pnl'],D('1.65'))
-        self.assertEqual(before['current_virtual_balance'],D('501.65'))
+        self.assertEqual(before['current_virtual_balance'],D('1001.65'))
         self.assertEqual(before['closed_complete'],3)
         self.assertEqual(before['open_episodes'],1)
         virtual.bootstrap(self.path)
@@ -31,7 +31,7 @@ class AccountingTests(unittest.TestCase):
         with patch.object(virtual,'quote',return_value=self.complete_quote('12')):
             a=virtual.accounting(self.path,self.api)
         self.assertEqual(a['unrealized_pnl_open'],D(12))
-        self.assertEqual(a['current_virtual_balance'],D('501.65'))
+        self.assertEqual(a['current_virtual_balance'],D('1001.65'))
 
     def test_unknown_funding_and_old_close_incomplete(self):
         q=self.complete_quote('.70');q.update(net_pnl=None,funding_realized_usdt=None,funding_status='UNKNOWN_SETTLEMENT_PNL')
@@ -42,7 +42,7 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(stored['funding_status'],'UNKNOWN_SETTLEMENT_PNL')
         a=virtual.accounting(self.path)
         self.assertEqual(a['incomplete_closed_pnl_count'],1)
-        self.assertEqual(a['current_virtual_balance'],500)
+        self.assertEqual(a['current_virtual_balance'],1000)
         self.assertEqual(a['used_capital'],0)
         with paper.session(self.path) as db:
             db.execute('UPDATE virtual_state SET close_json=?',(json.dumps(self.complete_quote('9')),))
@@ -84,7 +84,7 @@ class AccountingTests(unittest.TestCase):
         with patch.object(virtual,'quote',side_effect=ValueError('unavailable')):
             self.assertTrue(virtual.handle(self.api,{'message':{'text':'/status','chat':{'id':123},'from':{'id':123}}},123,self.path))
         message=self.api.telegram.call_args.args[0]
-        self.assertIn('Current virtual balance: 500.00',message)
+        self.assertIn('Current virtual balance: 1000.00',message)
         self.assertIn('Unrealized P&L open: UNKNOWN',message)
         self.assertEqual(self.state()['state'],'open')
         self.assertFalse(virtual.handle(self.api,{'message':{'text':'/status','chat':{'id':123},'from':{'id':999}}},123,self.path))

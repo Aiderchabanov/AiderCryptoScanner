@@ -95,7 +95,7 @@ class RecordFlowTests(unittest.TestCase):
         item=dict(self.item,symbol='OTHERUSDT',paper_budget_usdt=D(30),spot_cost=D(30),future_notional=D(30))
         token=d.begin()
         try:
-            with patch('virtual.used',return_value=D(250)),patch.object(basis,'LEG_USDT',D(30)),patch.object(paper,'storage_ready',return_value=False):
+            with patch('virtual.used',return_value=D(500)),patch.object(basis,'LEG_USDT',D(30)),patch.object(paper,'storage_ready',return_value=False):
                 self.assertIsNone(paper.record(item,self.path))
             blocked=[x for x in d.CYCLE.get()['flow_events'] if x['stage']=='PAPER_RECORD_BLOCKED']
             self.assertEqual(blocked[-1]['reason'],'MAX_WORKING_CAPITAL')

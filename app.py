@@ -685,7 +685,7 @@ def home():
             'basis_reserve_usdt_per_exchange': float(basis.RESERVE_USDT),
             'paper_storage_ready': paper.storage_ready(),
             'virtual_deposit_usdt': float(__import__('virtual').deposit()),
-            'virtual_capital_limit_usdt': float(__import__('virtual').deposit()/2)}
+            'virtual_capital_limit_usdt': float(__import__('virtual').working_capital_limit())}
 
 
 def telegram_updates():
