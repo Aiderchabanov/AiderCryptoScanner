@@ -1,6 +1,7 @@
 """Persistent PAPER lifecycle. Exchange calls are read-only; no order API exists here."""
 import json
 import binance_io
+import bingx_diagnostics as bxdiag
 import logging
 import math
 import os
@@ -517,6 +518,7 @@ def observe(api, path=None):
                 if level > current['last_warning']:
                     db.execute('UPDATE virtual_state SET last_warning=?,last_notice_spread=? WHERE episode_id=?',(level,str(spread),e['episode_id']))
         except Exception as exc:
+            bxdiag.emit(exc,e['episode_id'],e['symbol'],'observation')
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     funding_warnings(api,path)
     # Reuse funding already refreshed by the existing warning worker; no new GET.
@@ -618,6 +620,7 @@ def funding_warnings(api,path=None):
                 db.execute('UPDATE virtual_state SET last_notice_spread=? WHERE episode_id=?',(q['spread'],e['episode_id']))
             logging.info('Virtual funding warning sent: episode #%s, funding event %s',e['episode_id'],int(q['next_at']))
         except Exception as exc:
+            bxdiag.emit(exc,e['episode_id'],e['symbol'],'funding_warning')
             logging.warning('Virtual funding warning #%s unavailable or delivery uncertain (%s)',e['episode_id'],type(exc).__name__)
 
 

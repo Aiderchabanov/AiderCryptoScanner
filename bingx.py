@@ -1,5 +1,6 @@
 """Official BingX REST, GET-only allowlist. No order/transfer/withdrawal methods."""
 import entry_diagnostics as diagnostics
+import bingx_diagnostics as bxdiag
 import hashlib
 import hmac
 import os
@@ -32,6 +33,7 @@ class BingXUnavailable(RuntimeError):
     """Safe message: never attach request/response objects or signed URLs."""
 
 
+@bxdiag.trace(BingXUnavailable)
 def number(value, minimum=Decimal(0), strict=False):
     try:
         result = Decimal(str(value))
@@ -42,6 +44,7 @@ def number(value, minimum=Decimal(0), strict=False):
         raise BingXUnavailable('BingX required numeric field unavailable') from None
 
 
+@bxdiag.trace(BingXUnavailable)
 def pair(symbol):
     if not re.fullmatch(r'[A-Z0-9]+USDT', symbol):
         raise BingXUnavailable('BingX USDT symbol unavailable')
@@ -73,6 +76,7 @@ class Client:
     def credentials_ready(self):
         return bool(self.key and self.secret)
 
+    @bxdiag.trace(BingXUnavailable)
     def request(self, kind, params=None):
         if kind not in PATHS:
             raise BingXUnavailable('BingX endpoint not in GET-only allowlist')
@@ -103,9 +107,15 @@ class Client:
                 params['signature'] = hmac.new(self.secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
                 headers['X-BX-APIKEY'] = self.key
             try:
+                bxdiag.update(timeout=False, cooldown_active=False)
                 response = requests.get(BASE_URL + PATHS[kind], params=params, headers=headers,
                                         timeout=10, allow_redirects=False)
+                bxdiag.response_context(response)
                 if response.status_code != 200:
+                    try:
+                        bxdiag.response_context(response, response.json())
+                    except Exception:
+                        pass
                     if response.status_code in (401, 403, 418, 429):
                         retry = response.headers.get('Retry-After', '')
                         delay = 3600 if response.status_code in (401, 403, 418) else 60
@@ -118,7 +128,12 @@ class Client:
                                 seconds = 0
                         self._blocked_until = time.monotonic() + max(delay, seconds)
                     raise BingXUnavailable(f'BingX {kind} HTTP {response.status_code}')
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    bxdiag.update(json_error=type(exc).__name__)
+                    raise
+                bxdiag.response_context(response, payload)
                 if not isinstance(payload, dict) or payload.get('code') != 0:
                     code = payload.get('code') if isinstance(payload, dict) else None
                     if code == 100410:
@@ -130,7 +145,9 @@ class Client:
                     raise BingXUnavailable(f'BingX {kind} data unavailable')
                 self.last_success[kind] = time.time()
                 return payload['data']
-            except (requests.RequestException, ValueError):
+            except (requests.RequestException, ValueError) as exc:
+                if isinstance(exc, requests.RequestException):
+                    bxdiag.update(timeout=isinstance(exc, requests.Timeout), transport_error=type(exc).__name__)
                 raise BingXUnavailable(f'BingX {kind} transport/data unavailable') from None
 
     def cached(self, key, ttl, loader):
@@ -141,6 +158,7 @@ class Client:
         self._cache[key] = (time.monotonic() + ttl, result)
         return result
 
+    @bxdiag.trace(BingXUnavailable)
     def spot_symbols(self):
         data = self.cached('spot_symbols', 30, lambda: self.request('spot_symbols'))
         if not isinstance(data, dict) or not isinstance(data.get('symbols'), list):
@@ -148,6 +166,7 @@ class Client:
         return {r['symbol'].replace('-', ''): r for r in data['symbols']
                 if isinstance(r, dict) and r.get('symbol', '').endswith('-USDT') and r.get('status') == 1}
 
+    @bxdiag.trace(BingXUnavailable)
     def contracts(self):
         data = self.cached('contracts', 30, lambda: self.request('contracts'))
         if not isinstance(data, list):
@@ -159,6 +178,7 @@ class Client:
                 and r.get('currency') == 'USDT' and r.get('status') in (None, 1)
                 and enabled_flag(r.get('apiStateOpen')) and enabled_flag(r.get('apiStateClose'))}
 
+    @bxdiag.trace(BingXUnavailable)
     def tickers(self, futures=False):
         kind = 'futures_tickers' if futures else 'spot_tickers'
         data = self.request(kind)
@@ -182,6 +202,7 @@ class Client:
             result[symbol] = {'askPrice': str(ask), 'bidPrice': str(bid)}
         return result
 
+    @bxdiag.trace(BingXUnavailable)
     def book_ticker(self, symbol, futures=False):
         data = self.request('futures_book' if futures else 'spot_book', {'symbol': pair(symbol)})
         if futures and isinstance(data, dict) and isinstance(data.get('book_ticker'), dict):
@@ -194,12 +215,14 @@ class Client:
         return {'askPrice': number(data.get('askPrice'), strict=True),
                 'bidPrice': number(data.get('bidPrice'), strict=True)}
 
+    @bxdiag.trace(BingXUnavailable)
     def orderbook(self, symbol, futures=False):
         data = self.request('futures_depth' if futures else 'spot_depth', {'symbol': pair(symbol), 'limit': 100})
         if not isinstance(data, dict):
             raise BingXUnavailable('BingX orderbook unavailable')
         timestamp = number(data.get('T') if futures else data.get('ts'), strict=True)
         age = time.time() - float(timestamp / 1000)
+        bxdiag.update(stale_data=age > 30 or age < -5)
         if age > 30 or age < -5:
             raise BingXUnavailable('BingX stale orderbook')
         books = []
@@ -223,6 +246,7 @@ class Client:
             raise BingXUnavailable('BingX crossed orderbook')
         return tuple(books)
 
+    @bxdiag.trace(BingXUnavailable)
     def fee(self, symbol, futures=False):
         def load():
             data = self.request('futures_fee' if futures else 'spot_fee',
@@ -236,6 +260,7 @@ class Client:
             return value
         return self.cached(('fee', futures, symbol), 60, load)
 
+    @bxdiag.trace(BingXUnavailable)
     def spot_rules(self, symbol, side='buy'):
         row = self.spot_symbols().get(symbol)
         if not row or (row.get('apiStateBuy' if side == 'buy' else 'apiStateSell') is False):
@@ -247,6 +272,7 @@ class Client:
                 'market_max_qty': None, 'market_max_quote': number(row.get('maxMarketNotional'), strict=True)
                 if row.get('maxMarketNotional') is not None else None}
 
+    @bxdiag.trace(BingXUnavailable)
     def futures_meta(self, symbol):
         row = self.contracts().get(symbol)
         if not row:
@@ -259,6 +285,7 @@ class Client:
                 'min_notional': diagnostics.call('MISSING_MIN_NOTIONAL', number, row.get('tradeMinUSDT')),
                 'multiplier': Decimal(1), 'funding': None}
 
+    @bxdiag.trace(BingXUnavailable)
     def fresh_funding(self, symbol):
         data = self.request('funding', {'symbol': pair(symbol)})
         if isinstance(data, list):
@@ -274,6 +301,7 @@ class Client:
             raise BingXUnavailable('BingX current funding/settlement unavailable')
         return rate, next_at
 
+    @bxdiag.trace(BingXUnavailable)
     def networks(self, coin):
         data = self.cached(('networks', coin), 30, lambda: self.request('networks', {'coin': coin}))
         if not isinstance(data, list):

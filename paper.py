@@ -5,6 +5,7 @@ remain available for isolated tests. No exchange order or transfer API is used.
 """
 
 import json
+import bingx_diagnostics as bxdiag
 import logging
 import math
 import os
@@ -405,6 +406,7 @@ def poll(api, path=None, at=None):
                     continue
                 now_sample = actual_now
             except Exception as exc:
+                bxdiag.emit(exc,episode['id'],episode['symbol'],'checkpoint')
                 logging.warning('Virtual checkpoint %s +%sm unavailable: %s',
                                 episode['symbol'], minute, type(exc).__name__)
                 continue  # Retry until the sampling window expires.
