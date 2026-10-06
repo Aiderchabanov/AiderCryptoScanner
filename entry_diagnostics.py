@@ -1,4 +1,4 @@
-"""Observation only: no HTTP, database writes, policy or execution decisions."""
+"""Observation only: no HTTP, policy or execution decisions; existing JSON storage."""
 import json
 import logging
 import re
@@ -9,6 +9,89 @@ from decimal import Decimal, InvalidOperation
 
 STAGE = ContextVar('entry_diagnostic_stage', default='OTHER_MANDATORY_DATA')
 CYCLE = ContextVar('entry_diagnostic_cycle', default=None)
+CALCULATION = ContextVar('entry_diagnostic_calculation', default=None)
+NUMERIC_FIELDS = tuple('spot_ask spot_entry spot_quantity spot_cost spot_depth_usdt spot_fee spot_slippage_usdt future_bid future_entry quantity contracts future_notional futures_depth_usdt future_fee futures_slippage_usdt raw_spread_pct executable_spread_pct entry_fees_usdt slippage_usdt projected pct funding next_funding_at funding_age_seconds protective_reserve_usdt'.split())
+STATUS_FIELDS = tuple('fee_known depth_known market_params_known funding_known data_fresh min_order_valid expected_net_known'.split())
+
+def capture(**values):
+    """Copy allowlisted values already calculated by the entry path."""
+    current = CALCULATION.get()
+    if current is not None:
+        current.update({k:v for k,v in values.items() if k in NUMERIC_FIELDS + STATUS_FIELDS})
+
+def capture_book(venue, book):
+    try:
+        levels = book[0] if venue == 'spot' else book[1]
+        parsed = [(Decimal(str(p)), Decimal(str(q))) for p,q in levels]
+        depth = sum((p*q for p,q in parsed), Decimal(0)) if parsed and all(p.is_finite() and q.is_finite() and p>0 and q>0 for p,q in parsed) else None
+        capture(**{'spot_depth_usdt' if venue == 'spot' else 'futures_depth_usdt':depth})
+    except Exception:
+        pass
+
+def rejection_snapshot(code, item):
+    current = CALCULATION.get() or {}
+    saved = item.get('entry_calculation', {})
+    values = {**current, **saved, **item}
+    if saved.get('raw_spread_pct') is not None:
+        values['raw_spread_pct'] = saved['raw_spread_pct']
+    row = dict(timestamp=time.time(), symbol=safe(item.get('symbol')),
+               spot_exchange=safe(item.get('spot')), futures_exchange=safe(item.get('future')),
+               direction=safe(item.get('spot'))+'->'+safe(item.get('future')), reject_reason=safe(code))
+    for key in NUMERIC_FIELDS:
+        value = numeric(values.get(key))
+        row[key] = None if value == 'UNKNOWN' else value
+    for key in STATUS_FIELDS:
+        value = values.get(key)
+        row[key] = value if isinstance(value, bool) else None
+    row['expected_net_known'] = row['pct'] is not None
+    row['missing_mandatory_data'] = sorted(set(x for x in item.get('missing_mandatory_data', []) if x in CATEGORIES))
+    missing = row['missing_mandatory_data']
+    for key, categories in dict(fee_known=('MISSING_SPOT_FEE','MISSING_FUTURES_FEE'),
+            depth_known=('MISSING_SPOT_DEPTH','MISSING_FUTURES_DEPTH'),
+            market_params_known=('MISSING_SPOT_MARKET_PARAMS','MISSING_FUTURES_MARKET_PARAMS','MISSING_MIN_QTY','MISSING_STEP_SIZE','MISSING_MIN_NOTIONAL','MISSING_PRECISION'),
+            funding_known=('MISSING_FUNDING','MISSING_FUNDING_TIMESTAMP'),
+            data_fresh=('STALE_SPOT_DATA','STALE_FUTURES_DATA')).items():
+        if any(x in missing for x in categories):row[key]=False
+    cycle = CYCLE.get()
+    row['scan_started_at'] = cycle['started_at'] if cycle is not None else None
+    return row
+
+def retain_rejection(row):
+    current = CALCULATION.get()
+    if current is not None:current['_rejection_recorded'] = True
+    logging.info('Entry rejection calculation: %s', json.dumps(row, sort_keys=True))
+    cycle = CYCLE.get()
+    if cycle is not None and row['pct'] is not None:
+        cycle['top_rejections'].append(row)
+        cycle['top_rejections'].sort(key=lambda x: abs(Decimal(x['pct']) - Decimal('0.20')))
+        del cycle['top_rejections'][10:]
+
+def persist_rejection(db, row):
+    """Reuse existing JSON-capable metadata storage; never create an episode."""
+    key = 'entry_calculation:%s:%s:%s:%s' % (row['scan_started_at'] or row['timestamp'], row['direction'], row['symbol'], row['timestamp'])
+    db.execute('SAVEPOINT entry_calculation_write')
+    try:
+        db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?)', (key, json.dumps(row, sort_keys=True)))
+    except Exception:
+        db.execute('ROLLBACK TO SAVEPOINT entry_calculation_write')
+        raise
+    finally:
+        db.execute('RELEASE SAVEPOINT entry_calculation_write')
+
+def observe_no_entry(item):
+    """The existing evaluate path returned None without a named rejection.
+
+    Keep its reason UNKNOWN; do not introduce a policy reason or counter.
+    """
+    try:
+        row = rejection_snapshot('UNKNOWN',item)
+        retain_rejection(row)
+        import paper
+        if paper.storage_ready():
+            with paper.session() as db:
+                persist_rejection(db,row)
+    except Exception as exc:
+        logging.warning('Entry calculation observation unavailable (%s)',type(exc).__name__)
 CATEGORIES = tuple('MISSING_SPOT_FEE MISSING_FUTURES_FEE MISSING_FUNDING MISSING_FUNDING_TIMESTAMP MISSING_SPOT_DEPTH MISSING_FUTURES_DEPTH STALE_SPOT_DATA STALE_FUTURES_DATA MISSING_SPOT_MARKET_PARAMS MISSING_FUTURES_MARKET_PARAMS MISSING_MIN_QTY MISSING_STEP_SIZE MISSING_MIN_NOTIONAL MISSING_PRECISION MISSING_EXECUTABLE_PRICE OTHER_MANDATORY_DATA'.split())
 REJECTIONS = {'REJECTED_NON_POSITIVE_NET_ENTRY':'negative_net', 'REJECTED_LOW_EXPECTED_NET_RETURN':'expected_net_below_0_20', 'REJECTED_MIN_ORDER_ABOVE_TARGET':'min_order', 'REJECTED_NEGATIVE_FUNDING':'funding_nonpositive', 'REJECTED_UNKNOWN_FUNDING':'funding_unknown'}
 
@@ -85,7 +168,7 @@ def record(code, item):
         cycle['recent_missing'] = cycle['recent_missing'][-10:]
 
 def begin():
-    return CYCLE.set(dict(started_at=time.time(), counts=Counter(), directions={}, recent_missing=[]))
+    return CYCLE.set(dict(started_at=time.time(), counts=Counter(), directions={}, recent_missing=[], top_rejections=[]))
 
 def candidates(shortlist):
     cycle = CYCLE.get()
@@ -109,6 +192,7 @@ def completed(candidate_count, alert_count):
         return result
     total = full(cycle['counts'])
     total['candidates'] = candidate_count
+    logging.info('Entry rejection TOP10: %s', json.dumps(dict(scan_started_at=cycle['started_at'], top_rejections=cycle['top_rejections']), sort_keys=True))
     logging.info('Entry diagnostic scan complete: %s', json.dumps(dict(
         scan_started_at=cycle['started_at'], scan_completed_at=time.time(),
         candidates=candidate_count, conditional_alerts=alert_count, counts=total,

@@ -25,6 +25,12 @@ def reject(code,item=None,path=None,db=None):
     item=item or {}
     import entry_diagnostics
     entry_diagnostics.record(code,item)
+    try:
+        diagnostic_row = entry_diagnostics.rejection_snapshot(code,item)
+        entry_diagnostics.retain_rejection(diagnostic_row)
+    except Exception as exc:
+        diagnostic_row = None
+        logging.warning('Entry calculation diagnostic unavailable (%s)',type(exc).__name__)
     logging.info('Entry rejection: %s symbol=%s Spot=%s Futures=%s expected_net_return_pct=%s',code,item.get('symbol','-'),item.get('spot','-'),item.get('future','-'),item.get('pct','unknown'))
     try:
         import paper,virtual
@@ -32,5 +38,10 @@ def reject(code,item=None,path=None,db=None):
         with (nullcontext(db) if db is not None else paper.session(path)) as connection:
             virtual.ensure(connection)
             connection.execute("INSERT INTO virtual_meta (name,value) VALUES (?,'1') ON CONFLICT (name) DO UPDATE SET value=CAST(CAST(virtual_meta.value AS BIGINT)+1 AS TEXT)",('entry_rejection:'+code,))
+            if diagnostic_row is not None:
+                try:
+                    entry_diagnostics.persist_rejection(connection,diagnostic_row)
+                except Exception as exc:
+                    logging.warning('Entry calculation persistence unavailable (%s)',type(exc).__name__)
     except Exception as exc:
         logging.warning('Entry rejection counter unavailable (%s)',type(exc).__name__)
