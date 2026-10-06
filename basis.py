@@ -484,28 +484,19 @@ def _scan(api):
         diagnostics.flow('DOWNSTREAM_SELECTED_FOR_ALERT',item)
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
-            if item.get('executable_spread_pct', 0) > 5 or item.get('raw_spread_pct', 0) > 5:
-                import virtual
-                item = virtual.verified_entry(api, {'symbol':item['symbol'], 'spot_exchange':item['spot'], 'futures_exchange':item['future']})
-            # Recheck directly before creating an episode or sending Telegram.
-            diagnostics.flow('FINAL_FUNDING_RECHECK_ATTEMPT',item)
+            import virtual
+            diagnostics.flow('ENTRY_REVALIDATION_ATTEMPT',item)
             try:
-                rate, next_at = fresh_funding(api, item['future'], item['symbol'])
+                item = virtual.verified_entry(api, {'symbol':item['symbol'], 'spot_exchange':item['spot'], 'futures_exchange':item['future']})
             except Exception as exc:
-                diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',item,reason='RECHECK_EXCEPTION',exception_type=type(exc).__name__)
+                diagnostics.flow('ENTRY_REVALIDATION_FAILED',item,exception_type=type(exc).__name__)
                 raise
-            if rate <= 0:
-                diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',{**item,'funding':rate,'next_funding_at':next_at},reason='NONPOSITIVE_FUNDING')
-                logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING at final check',
-                             item['symbol'], item['spot'], item['future'])
-                continue
-            item['funding'], item['next_funding_at'] = rate, next_at
-            diagnostics.flow('FINAL_FUNDING_RECHECK_PASSED',item)
+            diagnostics.flow('ENTRY_REVALIDATION_PASSED',item)
             if not qualifies(item):
                 diagnostics.flow('FINAL_QUALIFIES_FAILED',item)
                 continue
             diagnostics.flow('FINAL_QUALIFIES_PASSED',item)
-            item['funding_crosses_60m'] = next_at <= time.time() + 3600
+            item['funding_crosses_60m'] = item['next_funding_at'] <= time.time() + 3600
             item['funding_debit'] = Decimal(0)  # Positive short funding is never booked as certain income.
             diagnostics.flow('PAPER_RECORD_ATTEMPT',item)
             episode_id = paper.record(item)

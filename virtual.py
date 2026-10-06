@@ -9,6 +9,7 @@ import secrets
 import time
 from decimal import Decimal
 import paper
+import entry_diagnostics as diagnostics
 
 D = Decimal
 SCHEMA = '''
@@ -695,8 +696,17 @@ def verified_entry(api,e):
             raise ValueError('Anomalous spread not confirmed')
         item = repeated
         item['anomaly'] = 'ANOMALOUS_SPREAD_RECONFIRMED'
-    rate,next_at = api.basis.fresh_funding(api,item['future'],item['symbol'])
+    tracing = diagnostics.CYCLE.get() is not None
+    if tracing: diagnostics.flow('FINAL_FUNDING_RECHECK_ATTEMPT',item)
+    try:
+        rate,next_at = api.basis.fresh_funding(api,item['future'],item['symbol'])
+    except Exception as exc:
+        if tracing: diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',item,reason='RECHECK_EXCEPTION',exception_type=type(exc).__name__)
+        raise
     item['funding'],item['next_funding_at'] = rate,next_at
+    if tracing:
+        if rate <= 0: diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',item,reason='NONPOSITIVE_FUNDING')
+        else: diagnostics.flow('FINAL_FUNDING_RECHECK_PASSED',item)
     if not api.basis.qualifies(item) or time.monotonic()-started > 30:
         raise ValueError('Fresh mandatory data unavailable')
     return item

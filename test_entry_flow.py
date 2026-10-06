@@ -54,11 +54,11 @@ class EvaluateFlowTests(unittest.TestCase):
         item=dict(symbol='ABCUSDT',spot='Gate',future='MEXC',pct=D('.3'),funding=D('.001'),next_funding_at=9999999999)
         api=Mock();api.multi_exchange=True;api.dec=D;api.credentials_ready.return_value=True
         api.market_maps.return_value=({'Gate':{'ABCUSDT':{'lowest_ask':'10'}}},{'MEXC':{'ABCUSDT':{'bidPrice':'11'}}})
-        with patch.object(paper,'storage_ready',return_value=True),patch.object(basis,'api_blocked_until',{}),patch.object(basis,'evaluate',return_value=item),patch.object(basis,'fresh_funding',return_value=(D('.001'),9999999999)) as funding,patch.object(paper,'record',return_value=None),patch.object(d,'flow',wraps=d.flow) as flow,patch.object(d,'completed'):
+        with patch.object(paper,'storage_ready',return_value=True),patch.object(basis,'api_blocked_until',{}),patch.object(basis,'evaluate',return_value=item),patch('virtual.verified_entry',return_value=item) as funding,patch.object(paper,'record',return_value=None),patch.object(d,'flow',wraps=d.flow) as flow,patch.object(d,'completed'):
             found=basis.scan(api)
         self.assertEqual(found,[item]);funding.assert_called_once()
         stages=[x.args[0] for x in flow.call_args_list]
-        for stage in ('SHORTLIST_CANDIDATE','ENTRY_GATE_PASSED','DOWNSTREAM_SELECTED_FOR_ALERT','FINAL_FUNDING_RECHECK_PASSED','FINAL_QUALIFIES_PASSED','PAPER_RECORD_ATTEMPT'):
+        for stage in ('SHORTLIST_CANDIDATE','ENTRY_GATE_PASSED','DOWNSTREAM_SELECTED_FOR_ALERT','ENTRY_REVALIDATION_PASSED','FINAL_QUALIFIES_PASSED','PAPER_RECORD_ATTEMPT'):
             self.assertEqual(stages.count(stage),1)
         api.telegram.assert_not_called()
 
