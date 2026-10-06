@@ -462,6 +462,26 @@ def risk_alert(db, e, q):
         import episode22_diagnostics
         episode22_diagnostics.emit(e,q,'hysteresis',diagnostic_notified_before,spread_notified,crossed_spread)
 
+def record_bingx_offline(db, ident, exc, worker):
+    """Record only a new natural failure; never manufacture an exit valuation."""
+    if not bxdiag.is_offline(exc):
+        return
+    current = db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(ident,)).fetchone()
+    if not current or current['state'] != 'open':
+        return
+    at = time.time()
+    snapshot = {k:exc.diagnostic_context.get(k,'UNKNOWN') for k in bxdiag.FIELDS}
+    snapshot.update(timestamp=at, episode_id=ident, status='OPEN', worker=worker,
+                    block_reason='BINGX_SYMBOL_OFFLINE', current_executable_quote=None,
+                    current_executable_spread=None, trading_net_pnl=None, full_net_pnl=None)
+    result=db.execute("UPDATE virtual_state SET current_json=NULL,sampled_at=? WHERE episode_id=? AND state='open'",(at,ident))
+    if not result.rowcount:
+        return
+    db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",
+               (f'quote_availability:{ident}',json.dumps(snapshot)))
+    logging.warning('BINGX_SYMBOL_OFFLINE_STATE: %s',json.dumps(snapshot,sort_keys=True))
+
+
 def observe(api, path=None):
     # Manual closure of a continuing gap must not create a fresh entry next scan.
     with paper.session(path) as db:
@@ -485,6 +505,7 @@ def observe(api, path=None):
                 if current['state'] != 'open':
                     continue
                 db.execute('UPDATE virtual_state SET current_json=?,sampled_at=? WHERE episode_id=?',(json.dumps(q),q['at'],e['episode_id']))
+                db.execute('DELETE FROM virtual_meta WHERE name=?',(f'quote_availability:{e["episode_id"]}',))
                 spread = D(q['spread'])
                 # Convergence is the same +/-0.10% band for every entry sign.
                 entry = D(e['executable_spread_pct'])
@@ -518,6 +539,12 @@ def observe(api, path=None):
                 if level > current['last_warning']:
                     db.execute('UPDATE virtual_state SET last_warning=?,last_notice_spread=? WHERE episode_id=?',(level,str(spread),e['episode_id']))
         except Exception as exc:
+            if bxdiag.is_offline(exc):
+                try:
+                    with paper.session(path) as db:
+                        record_bingx_offline(db,e['episode_id'],exc,'observation')
+                except Exception as diagnostic_error:
+                    logging.warning('Offline state persistence unavailable (%s)',type(diagnostic_error).__name__)
             bxdiag.emit(exc,e['episode_id'],e['symbol'],'observation')
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     funding_warnings(api,path)

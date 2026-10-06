@@ -451,7 +451,9 @@ def _scan(api):
                 api_blocked_until[future] = time.time() + delay
             import entry_policy
             if not getattr(exc,'entry_rejection_counted',False):
-                entry_policy.reject('REJECTED_UNAVAILABLE_MANDATORY_DATA',{'symbol':symbol,'spot':spot,'future':future,'raw_spread_pct':_ * 100,'missing_mandatory_data':diagnostics.classify(exc),'mexc_spot_quantity_reasons':getattr(exc,'mexc_spot_quantity_reasons',[]),'entry_calculation':getattr(exc,'entry_calculation',{})})
+                import bingx_diagnostics
+                rejection = 'REJECTED_SYMBOL_NOT_TRADABLE' if bingx_diagnostics.is_offline(exc) else 'REJECTED_UNAVAILABLE_MANDATORY_DATA'
+                entry_policy.reject(rejection,{'symbol':symbol,'spot':spot,'future':future,'raw_spread_pct':_ * 100,'missing_mandatory_data':diagnostics.classify(exc),'mexc_spot_quantity_reasons':getattr(exc,'mexc_spot_quantity_reasons',[]),'entry_calculation':getattr(exc,'entry_calculation',{})})
             logging.warning('Basis skipped %s %s/%s: %s HTTP %s at %s', symbol, spot,
                             future, type(exc).__name__, status or '-',
                             (getattr(response, 'url', '') or '').split('?')[0])

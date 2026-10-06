@@ -264,6 +264,8 @@ class Client:
     def spot_rules(self, symbol, side='buy'):
         row = self.spot_symbols().get(symbol)
         if not row or (row.get('apiStateBuy' if side == 'buy' else 'apiStateSell') is False):
+            if row and row.get('apiStateBuy' if side == 'buy' else 'apiStateSell') is False:
+                bxdiag.update(reason='BINGX_SYMBOL_OFFLINE', availability_status='OFFLINE')
             raise BingXUnavailable('BingX spot inactive')
         return {'min_qty': diagnostics.call('MISSING_MIN_QTY', number, row.get('minQty')), 'min_quote': diagnostics.call('MISSING_MIN_NOTIONAL', number, row.get('minNotional')),
                 'max_qty': number(row.get('maxQty'), strict=True),

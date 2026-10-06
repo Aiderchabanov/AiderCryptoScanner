@@ -8,7 +8,7 @@ from contextvars import ContextVar
 
 CONTEXT = ContextVar('bingx_error_context', default=None)
 UNKNOWN = 'UNKNOWN'
-FIELDS = tuple('exchange market operation endpoint_class symbol http_status api_code api_message timeout transport_error json_error missing_data stale_data cooldown_active exception_type reason'.split())
+FIELDS = tuple('exchange market operation endpoint_class symbol http_status api_code api_message api_message_safe availability_status timeout transport_error json_error missing_data stale_data cooldown_active exception_type reason'.split())
 OPERATIONS = {'orderbook':'orderbook', 'fee':'fee', 'fresh_funding':'funding',
               'contracts':'market_metadata', 'spot_symbols':'market_metadata',
               'futures_meta':'market_metadata', 'spot_rules':'market_metadata',
@@ -53,6 +53,17 @@ def response_context(response, payload=None):
         code = payload.get('code')
         current['api_code'] = code if type(code) is int else UNKNOWN
         current['api_message'] = safe_text(payload.get('msg', payload.get('message')), current.get('_secrets', ()))
+        current['api_message_safe'] = current['api_message']
+        symbol = current.get('symbol', UNKNOWN)
+        # Require an explicit statement about this exact symbol, not a generic error.
+        if code != 0 and type(code) is int and symbol != UNKNOWN and re.search(
+                r'(?<![A-Za-z0-9_-])'+re.escape(symbol)+r'\s+is\s+(?:offline\b|unavailable\b|not tradable\b)',
+                current['api_message'], re.IGNORECASE):
+            current.update(reason='BINGX_SYMBOL_OFFLINE', availability_status='OFFLINE')
+
+def is_offline(exc):
+    context = getattr(exc, 'diagnostic_context', {})
+    return type(exc).__name__ == 'BingXUnavailable' and context.get('availability_status') == 'OFFLINE'
 
 def trace(error_class):
     def decorate(function):
@@ -98,7 +109,8 @@ def trace(error_class):
                     saved = dict(getattr(exc, 'diagnostic_context', {}) or current)
                     saved['operation'] = current['operation']
                     saved['exception_type'] = type(exc).__name__
-                    saved['reason'] = safe_text(str(exc), current.get('_secrets', ()))
+                    if saved.get('availability_status') != 'OFFLINE':
+                        saved['reason'] = safe_text(str(exc), current.get('_secrets', ()))
                     if 'stale' in str(exc).lower(): saved['stale_data'] = True
                     if 'cooldown' in str(exc).lower(): saved['cooldown_active'] = True
                     if str(exc) in ('BingX required numeric field unavailable','BingX orderbook unavailable','BingX orderbook depth unavailable','BingX personal trading fee unavailable','BingX funding unavailable','BingX perpetual inactive','BingX spot inactive','BingX perpetual contracts unavailable','BingX spot symbols unavailable') or str(exc).endswith(' data unavailable'): saved['missing_data'] = True

@@ -406,6 +406,15 @@ def poll(api, path=None, at=None):
                     continue
                 now_sample = actual_now
             except Exception as exc:
+                if bxdiag.is_offline(exc):
+                    db.execute('SAVEPOINT bingx_offline_checkpoint')
+                    try:
+                        virtual.record_bingx_offline(db,episode['id'],exc,'checkpoint')
+                    except Exception as diagnostic_error:
+                        db.execute('ROLLBACK TO SAVEPOINT bingx_offline_checkpoint')
+                        logging.warning('Offline state persistence unavailable (%s)',type(diagnostic_error).__name__)
+                    finally:
+                        db.execute('RELEASE SAVEPOINT bingx_offline_checkpoint')
                 bxdiag.emit(exc,episode['id'],episode['symbol'],'checkpoint')
                 logging.warning('Virtual checkpoint %s +%sm unavailable: %s',
                                 episode['symbol'], minute, type(exc).__name__)
