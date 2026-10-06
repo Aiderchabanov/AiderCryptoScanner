@@ -226,8 +226,10 @@ def evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
             item['entry_calculation'] = dict(diagnostics.CALCULATION.get())
         elif not diagnostics.CALCULATION.get().get('_rejection_recorded'):
             diagnostics.observe_no_entry({'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
+        diagnostics.flow('EVALUATE_RETURNED' if item is not None else 'EVALUATE_NONE',item or {'symbol':symbol,'spot':spot_exchange,'future':future_exchange})
         return item
     except Exception as exc:
+        diagnostics.flow('EVALUATE_EXCEPTION',{'symbol':symbol,'spot':spot_exchange,'future':future_exchange},exception_type=type(exc).__name__)
         exc.entry_calculation = dict(diagnostics.CALCULATION.get())
         if not getattr(exc, 'missing_mandatory_data', None):
             exc.missing_mandatory_data = diagnostics.classify(exc)
@@ -256,11 +258,13 @@ def _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
     future_asks, bids = future_book
     diagnostics.capture(depth_known=bool(asks and bids))
     if not asks or not bids:
+        diagnostics.silent('NO_USABLE_DEPTH')
         return None
     diagnostics.mark('MISSING_EXECUTABLE_PRICE')
     spot_ask, perp_bid = api.dec(asks[0][0]), api.dec(bids[0][0])
     diagnostics.capture(spot_ask=spot_ask, future_bid=perp_bid)
     if not spot_ask or not perp_bid or spot_ask <= 0 or perp_bid <= 0:
+        diagnostics.silent('INVALID_TOP_PRICE')
         return None
     rules = diagnostics.call('MISSING_SPOT_MARKET_PARAMS', api.spot_rules, spot_exchange, symbol, 'buy')
     # Step expresses allowed quantity precision; Futures size is rounded down by it.
@@ -297,6 +301,7 @@ def _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
                         spot_entry=cost/acquired if cost is not None and acquired>0 else None,
                         future_entry=short_proceeds/quantity if short_proceeds is not None and quantity>0 else None)
     if cost is None or short_proceeds is None or cost > LEG_USDT or short_proceeds > LEG_USDT:
+        diagnostics.silent('EXECUTABLE_COST_OR_NOTIONAL_ABOVE_TARGET')
         return None
     if acquired < rules['min_qty'] or cost < rules['min_quote'] or short_proceeds < meta['min_notional']:
         diagnostics.capture(min_order_valid=False)
@@ -305,14 +310,18 @@ def _evaluate(api, symbol, spot_exchange, future_exchange, funding_hint=None):
         logging.info('REJECTED_MIN_ORDER_ABOVE_TARGET: %s %s/%s target=%s USDT; minimum size/notional fails at executable prices',symbol,spot_exchange,future_exchange,LEG_USDT)
         return None
     if not api.order_size_ok(rules, acquired, cost):
+        diagnostics.silent('ORDER_SIZE_NOT_OK',order_size_ok=False)
         return None
+    diagnostics.capture(order_size_ok=True)
     if cost < LEG_USDT * Decimal('0.8') or short_proceeds < LEG_USDT * Decimal('0.8'):
+        diagnostics.silent('LEG_BELOW_80_PERCENT_TARGET')
         return None
     raw_spread = (perp_bid / spot_ask - 1) * 100
     executable_spread = ((short_proceeds / quantity) / (cost / acquired) - 1) * 100
     diagnostics.capture(raw_spread_pct=raw_spread,executable_spread_pct=executable_spread,min_order_valid=True)
     category = spread_category(raw_spread, executable_spread)
     if category is None:
+        diagnostics.silent('SPREAD_CATEGORY_MISMATCH')
         return None
     try:
         funding, next_funding = diagnostics.call('MISSING_FUNDING', fresh_funding, api, future_exchange, symbol)
@@ -428,14 +437,19 @@ def _scan(api):
     diagnostics.candidates(shortlist)
     found = []
     for _, symbol, spot, future, funding in shortlist:
+        trace_item={'symbol':symbol,'spot':spot,'future':future}
+        diagnostics.flow('SHORTLIST_CANDIDATE',trace_item)
         if time.time() < api_blocked_until.get(future, 0):
+            diagnostics.flow('EVALUATE_SKIPPED',trace_item,reason='FUTURES_LOCAL_COOLDOWN')
             continue
         try:
             item = evaluate(api, symbol, spot, future, funding)
             if item and qualifies(item):
+                diagnostics.flow('ENTRY_GATE_PASSED',item)
                 found.append(item)
             elif item:
                 import entry_policy
+                diagnostics.flow('ENTRY_GATE_FAILED',item,reason=entry_policy.reason(item))
                 entry_policy.reject(entry_policy.reason(item),item)
         except Exception as exc:
             response = getattr(exc, 'response', None)
@@ -462,23 +476,37 @@ def _scan(api):
     alerts = [item for category in ('POSITIVE', 'NEGATIVE')
               for item in [x for x in found if x.get('category', 'POSITIVE') == category][:3]]
     dispatched=0
+    selected={id(item) for item in alerts}
+    for item in found:
+        if id(item) not in selected:diagnostics.flow('DOWNSTREAM_NOT_SELECTED',item,reason='EXISTING_ALERT_SELECTION_LIMIT')
     for item in alerts:
+        diagnostics.flow('DOWNSTREAM_SELECTED_FOR_ALERT',item)
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
             if item.get('executable_spread_pct', 0) > 5 or item.get('raw_spread_pct', 0) > 5:
                 import virtual
                 item = virtual.verified_entry(api, {'symbol':item['symbol'], 'spot_exchange':item['spot'], 'futures_exchange':item['future']})
             # Recheck directly before creating an episode or sending Telegram.
-            rate, next_at = fresh_funding(api, item['future'], item['symbol'])
+            diagnostics.flow('FINAL_FUNDING_RECHECK_ATTEMPT',item)
+            try:
+                rate, next_at = fresh_funding(api, item['future'], item['symbol'])
+            except Exception as exc:
+                diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',item,reason='RECHECK_EXCEPTION',exception_type=type(exc).__name__)
+                raise
             if rate <= 0:
+                diagnostics.flow('FINAL_FUNDING_RECHECK_FAILED',{**item,'funding':rate,'next_funding_at':next_at},reason='NONPOSITIVE_FUNDING')
                 logging.info('Basis %s %s/%s REJECTED_NEGATIVE_FUNDING at final check',
                              item['symbol'], item['spot'], item['future'])
                 continue
             item['funding'], item['next_funding_at'] = rate, next_at
+            diagnostics.flow('FINAL_FUNDING_RECHECK_PASSED',item)
             if not qualifies(item):
+                diagnostics.flow('FINAL_QUALIFIES_FAILED',item)
                 continue
+            diagnostics.flow('FINAL_QUALIFIES_PASSED',item)
             item['funding_crosses_60m'] = next_at <= time.time() + 3600
             item['funding_debit'] = Decimal(0)  # Positive short funding is never booked as certain income.
+            diagnostics.flow('PAPER_RECORD_ATTEMPT',item)
             episode_id = paper.record(item)
             if episode_id is None:
                 continue  # Same continuous spread episode.
@@ -492,6 +520,7 @@ def _scan(api):
             if cycle is not None:
                 cycle['directions'].setdefault(item['spot']+'->'+item['future'], diagnostics.Counter())['conditional_alerts'] += 1
         except Exception as exc:
+            diagnostics.flow('DOWNSTREAM_EXCEPTION',item,exception_type=type(exc).__name__)
             logging.warning('Basis alert unverified: persistent episode unavailable (%s)',
                             type(exc).__name__)
     logging.info('basis scan: candidates=%s, conditional alerts=%s',len(shortlist),dispatched)

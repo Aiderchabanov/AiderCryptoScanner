@@ -179,7 +179,20 @@ def save_api_backoff(host, until_at):
 
 
 def record(item, path=None, at=None, parent_id=None, connection=None):
+    import entry_diagnostics
+    try:
+        ident=_record(item,path,at,parent_id,connection)
+    except Exception as exc:
+        database_error=isinstance(exc,sqlite3.Error) or type(exc).__module__.split('.')[0] in ('psycopg','psycopg2')
+        entry_diagnostics.flow('PAPER_RECORD_EXCEPTION',item,reason='PERSISTENCE_FAILURE' if database_error else 'RECORD_EXCEPTION',exception_type=type(exc).__name__)
+        raise
+    if ident is not None:entry_diagnostics.flow('PAPER_RECORD_CREATED',item,episode_id=ident)
+    return ident
+
+
+def _record(item, path=None, at=None, parent_id=None, connection=None):
     """Create one episode for a qualified alert; return its ID or None."""
+    import entry_diagnostics
     now = time.time() if at is None else at
     import entry_policy
     item=dict(item)
@@ -187,23 +200,29 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
     rejection=entry_policy.reason(item,now)
     if rejection:
         entry_policy.reject(rejection,item,path,connection)
+        entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='ENTRY_POLICY_REJECTED')
         return None
     try:
         rate = Decimal(str(item['funding']))
         next_at = float(item['next_funding_at'])
     except (KeyError, InvalidOperation, ValueError, TypeError):
+        entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='FUNDING_PARSE_FAILED')
         return None
     if not rate.is_finite() or rate <= 0 or not math.isfinite(next_at) or next_at <= now:
+        entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='FUNDING_INVALID_OR_NONPOSITIVE')
         return None  # Defense in depth; basis.scan also rechecks live funding.
     if 'verified_at' in item and (not math.isfinite(item['verified_at']) or not 0 <= now-item['verified_at'] <= 30):
+        entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='VERIFIED_AT_STALE')
         return None
     raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
     executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
     if raw < 0 or executable < 0:
         if not (Decimal('-2') <= raw < 0 and Decimal('-2') <= executable < 0
                 and next_at - now >= 4 * 3600):
+            entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='NEGATIVE_SPREAD_RULE_FAILED')
             return None
     elif raw == 0 or executable == 0:
+        entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='ZERO_SPREAD')
         return None
     import virtual
     with (nullcontext(connection) if connection is not None else session(path)) as db:
@@ -218,6 +237,7 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         if parent_id is None and db.execute('''SELECT 1 FROM episodes e JOIN virtual_state v ON e.id=v.episode_id
                 WHERE e.symbol=? AND e.spot_exchange=? AND e.futures_exchange=? AND v.state='open' ''',
                 (item['symbol'], item['spot'], item['future'])).fetchone():
+            entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='EXISTING_OPEN_EPISODE')
             return None
         prior = db.execute('''SELECT * FROM episodes WHERE symbol=? AND spot_exchange=?
                AND futures_exchange=? ORDER BY started_at DESC LIMIT 1''',
@@ -225,27 +245,33 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         if parent_id is None and prior:
             state = db.execute('SELECT * FROM virtual_state WHERE episode_id=?', (prior['id'],)).fetchone()
             if state and state['state']=='closed' and not db.execute('SELECT 1 FROM virtual_meta WHERE name=?', (f"gapreset:{prior['id']}",)).fetchone():
+                entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='PRIOR_CLOSED_WITHOUT_GAPRESET')
                 return None
         if parent_id is None and prior and (prior['status'] == 'observing' or
                       (prior['first_close_min'] is None and
                        now < prior['started_at'] + EPISODE_COOLDOWN_SECONDS)):
+            entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='CONTINUOUS_EPISODE_OR_COOLDOWN')
             return None
         budget = item.get('paper_budget_usdt')
         if budget is not None:
             budget = Decimal(str(budget))
             if not budget.is_finite() or budget != __import__('basis').LEG_USDT:
+                entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='PAPER_BUDGET_INVALID')
                 return None
             addition = virtual.capital(item['spot_cost'],item['future_notional'])
             if virtual.used(db) + addition > min(virtual.deposit() / 2, Decimal(250)):
                 entry_policy.reject('REJECTED_MAX_DEPOSIT_LOAD',item,path,db)
+                entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='MAX_WORKING_CAPITAL')
                 return None
             for key in ('spot_fee', 'future_fee', 'multiplier'):
                 value = virtual.number(item[key], positive=(key == 'multiplier'))
                 if key != 'multiplier' and not Decimal(0) <= value < Decimal(1):
+                    entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='INVALID_FEE_OR_MULTIPLIER')
                     return None
             if parent_id is not None:
                 parent = db.execute("SELECT e.symbol,e.spot_exchange,e.futures_exchange FROM episodes e JOIN virtual_state v ON e.id=v.episode_id WHERE e.id=? AND v.state='open'", (parent_id,)).fetchone()
                 if not parent or (parent['symbol'], parent['spot_exchange'], parent['futures_exchange']) != (item['symbol'], item['spot'], item['future']):
+                    entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='PARENT_EPISODE_INVALID')
                     return None
         raw = (item['future_bid'] / item['spot_ask'] - 1) * 100
         executable = (item['future_entry'] / item['spot_entry'] - 1) * 100
@@ -279,7 +305,6 @@ def record(item, path=None, at=None, parent_id=None, connection=None):
         if budget is not None:
             virtual.register(db, episode_id, item, parent_id)
         return episode_id
-
 
 def executable_sample(api, episode):
     """Fresh matched-quantity ask/bid books; never use last-trade prices."""

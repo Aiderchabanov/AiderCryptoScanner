@@ -11,7 +11,39 @@ STAGE = ContextVar('entry_diagnostic_stage', default='OTHER_MANDATORY_DATA')
 CYCLE = ContextVar('entry_diagnostic_cycle', default=None)
 CALCULATION = ContextVar('entry_diagnostic_calculation', default=None)
 NUMERIC_FIELDS = tuple('spot_ask spot_entry spot_quantity spot_cost spot_depth_usdt spot_fee spot_slippage_usdt future_bid future_entry quantity contracts future_notional futures_depth_usdt future_fee futures_slippage_usdt raw_spread_pct executable_spread_pct entry_fees_usdt slippage_usdt projected pct funding next_funding_at funding_age_seconds protective_reserve_usdt'.split())
-STATUS_FIELDS = tuple('fee_known depth_known market_params_known funding_known data_fresh min_order_valid expected_net_known'.split())
+STATUS_FIELDS = tuple('fee_known depth_known market_params_known funding_known data_fresh min_order_valid expected_net_known order_size_ok'.split())
+
+def silent(reason, **values):
+    """Annotate the existing return; never decide whether to return."""
+    try:
+        current=CALCULATION.get()
+        if current is not None:
+            current['silent_return_reason']=safe(reason)
+            current.update({k:v for k,v in values.items() if k in STATUS_FIELDS})
+    except Exception:
+        pass
+
+def flow(stage, item, reason=None, episode_id=None, exception_type=None):
+    """Allowlisted lifecycle trace; no HTTP and no trading decision."""
+    try:
+        cycle=CYCLE.get()
+        row=dict(scan_started_at=cycle['started_at'] if cycle else None,
+                 timestamp=time.time(),stage=safe(stage),symbol=safe(item.get('symbol')),
+                 spot_exchange=safe(item.get('spot')),futures_exchange=safe(item.get('future')),
+                 direction=safe(item.get('spot'))+'->'+safe(item.get('future')),
+                 reason=safe(reason) if reason is not None else None,
+                 episode_id=episode_id if type(episode_id) is int else None,
+                 exception_type=safe(exception_type) if exception_type else None,
+                 entry_gate_passed=True if stage=='ENTRY_GATE_PASSED' else None)
+        for key in ('pct','funding','next_funding_at','spot_cost','future_notional'):
+            value=numeric(item.get(key));row[key]=None if value=='UNKNOWN' else value
+        current=CALCULATION.get() or item.get('entry_calculation',{})
+        row['silent_return_reason']=current.get('silent_return_reason')
+        row['order_size_ok']=current.get('order_size_ok') if type(current.get('order_size_ok')) is bool else None
+        logging.info('Entry flow diagnostic: %s',json.dumps(row,sort_keys=True))
+        if cycle is not None:cycle.setdefault('flow_events',[]).append(row)
+    except Exception:
+        logging.warning('Entry flow diagnostic unavailable')
 
 def capture(**values):
     """Copy allowlisted values already calculated by the entry path."""
@@ -44,6 +76,7 @@ def rejection_snapshot(code, item):
         value = values.get(key)
         row[key] = value if isinstance(value, bool) else None
     row['expected_net_known'] = row['pct'] is not None
+    row['silent_return_reason']=safe(values['silent_return_reason']) if values.get('silent_return_reason') else None
     row['missing_mandatory_data'] = sorted(set(x for x in item.get('missing_mandatory_data', []) if x in CATEGORIES))
     missing = row['missing_mandatory_data']
     for key, categories in dict(fee_known=('MISSING_SPOT_FEE','MISSING_FUTURES_FEE'),
@@ -61,6 +94,10 @@ def retain_rejection(row):
     if current is not None:current['_rejection_recorded'] = True
     logging.info('Entry rejection calculation: %s', json.dumps(row, sort_keys=True))
     cycle = CYCLE.get()
+    if cycle is not None:
+        cycle['calculation_records']=cycle.get('calculation_records',0)+1
+        if row.get('silent_return_reason'):
+            cycle['silent_return_records']=cycle.get('silent_return_records',0)+1
     if cycle is not None and row['pct'] is not None:
         cycle['top_rejections'].append(row)
         cycle['top_rejections'].sort(key=lambda x: abs(Decimal(x['pct']) - Decimal('0.20')))
@@ -193,8 +230,26 @@ def completed(candidate_count, alert_count):
     total = full(cycle['counts'])
     total['candidates'] = candidate_count
     logging.info('Entry rejection TOP10: %s', json.dumps(dict(scan_started_at=cycle['started_at'], top_rejections=cycle['top_rejections']), sort_keys=True))
+    logging.info('Entry flow scan complete: %s',json.dumps(dict(scan_started_at=cycle['started_at'],
+        calculation_records=cycle.get('calculation_records',0),silent_return_records=cycle.get('silent_return_records',0),
+        stage_counts=dict(Counter(row['stage'] for row in cycle.get('flow_events',[])))),sort_keys=True))
     logging.info('Entry diagnostic scan complete: %s', json.dumps(dict(
         scan_started_at=cycle['started_at'], scan_completed_at=time.time(),
         candidates=candidate_count, conditional_alerts=alert_count, counts=total,
         directions={k:full(v) for k,v in cycle['directions'].items()},
         recent_missing=cycle['recent_missing']), sort_keys=True))
+    try:
+        import paper
+        if paper.storage_ready():
+            with paper.session() as db:
+                db.execute('SAVEPOINT entry_flow_write')
+                try:
+                    db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value',
+                               ('entry_flow:'+str(cycle['started_at']),json.dumps(cycle.get('flow_events',[]),sort_keys=True)))
+                except Exception:
+                    db.execute('ROLLBACK TO SAVEPOINT entry_flow_write')
+                    raise
+                finally:
+                    db.execute('RELEASE SAVEPOINT entry_flow_write')
+    except Exception as exc:
+        logging.warning('Entry flow persistence unavailable (%s)',type(exc).__name__)
