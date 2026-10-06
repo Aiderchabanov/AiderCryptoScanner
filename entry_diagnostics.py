@@ -13,6 +13,46 @@ CALCULATION = ContextVar('entry_diagnostic_calculation', default=None)
 NUMERIC_FIELDS = tuple('spot_ask spot_entry spot_quantity spot_cost spot_depth_usdt spot_fee spot_slippage_usdt future_bid future_entry quantity contracts future_notional futures_depth_usdt future_fee futures_slippage_usdt raw_spread_pct executable_spread_pct entry_fees_usdt slippage_usdt projected pct funding next_funding_at funding_age_seconds protective_reserve_usdt'.split())
 STATUS_FIELDS = tuple('fee_known depth_known market_params_known funding_known data_fresh min_order_valid expected_net_known order_size_ok'.split())
 
+def verification_snapshot(stage, item, pass_name=None, exception_type=None):
+    """Observe existing calculations only; no rejection counters or DB round trip."""
+    try:
+        cycle = CYCLE.get()
+        if cycle is None:
+            return
+        row = rejection_snapshot('UNKNOWN', item)
+        row.update(stage=safe(stage), pass_name=safe(pass_name) if pass_name else None,
+                   reject_reason=None, exception_type=safe(exception_type) if exception_type else None)
+        rows = cycle.setdefault('verification_calculations', [])
+        row['snapshot_index'] = len(rows)
+        rows.append(row)
+        logging.info('Entry verification calculation: %s', json.dumps(row, sort_keys=True))
+    except Exception:
+        try: logging.warning('Entry verification diagnostic unavailable')
+        except Exception: pass
+
+def verification_rejected(item, pass_name):
+    """Annotate an already reached failure branch, without calling reject()."""
+    try:
+        cycle = CYCLE.get()
+        if cycle is None or not item:
+            return
+        import entry_policy
+        reason = entry_policy.reason(item)
+        rows = cycle.get('verification_calculations', [])
+        row = next((r for r in reversed(rows) if r['stage']=='REVALIDATED_CALCULATION'
+                    and r['pass_name']==pass_name and r['symbol']==safe(item.get('symbol'))
+                    and r['spot_exchange']==safe(item.get('spot'))
+                    and r['futures_exchange']==safe(item.get('future'))), None)
+        if row is not None:
+            row['reject_reason'] = safe(reason) if reason is not None else None
+            logging.info('Entry verification decision: %s', json.dumps(dict(
+                scan_started_at=row['scan_started_at'], snapshot_index=row['snapshot_index'],
+                symbol=row['symbol'], direction=row['direction'], pass_name=pass_name,
+                reject_reason=row['reject_reason']), sort_keys=True))
+    except Exception:
+        try: logging.warning('Entry verification diagnostic unavailable')
+        except Exception: pass
+
 def silent(reason, **values):
     """Annotate the existing return; never decide whether to return."""
     try:
@@ -242,6 +282,19 @@ def completed(candidate_count, alert_count):
         import paper
         if paper.storage_ready():
             with paper.session() as db:
+                try:
+                    db.execute('SAVEPOINT entry_verification_write')
+                    try:
+                        db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value',
+                                   ('entry_verification_calculations:'+str(cycle['started_at']),
+                                    json.dumps(cycle.get('verification_calculations', []), sort_keys=True)))
+                    except Exception:
+                        db.execute('ROLLBACK TO SAVEPOINT entry_verification_write')
+                        raise
+                    finally:
+                        db.execute('RELEASE SAVEPOINT entry_verification_write')
+                except Exception:
+                    logging.warning('Entry verification persistence unavailable')
                 db.execute('SAVEPOINT entry_flow_write')
                 try:
                     db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value',

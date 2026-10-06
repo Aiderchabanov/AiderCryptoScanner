@@ -686,13 +686,28 @@ def dispatch(api,path=None):
 @binance_io.fresh
 def verified_entry(api,e):
     started = time.monotonic()
-    item = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])
+    context = {'symbol':e['symbol'], 'spot':e['spot_exchange'], 'future':e['futures_exchange']}
+    try:
+        item = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])
+    except Exception as exc:
+        diagnostics.verification_snapshot('REVALIDATED_CALCULATION',dict(context,
+            entry_calculation=getattr(exc,'entry_calculation',{})), 'PRIMARY', type(exc).__name__)
+        raise
+    diagnostics.verification_snapshot('REVALIDATED_CALCULATION',item or context,'PRIMARY')
     if not item or not api.basis.qualifies(item):
+        diagnostics.verification_rejected(item,'PRIMARY')
         raise ValueError('Entry filters failed')
     anomaly = D(item['executable_spread_pct']) > 5 or D(item['raw_spread_pct']) > 5
     if anomaly:
-        repeated = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])
+        try:
+            repeated = api.basis.evaluate(api,e['symbol'],e['spot_exchange'],e['futures_exchange'])
+        except Exception as exc:
+            diagnostics.verification_snapshot('REVALIDATED_CALCULATION',dict(context,
+                entry_calculation=getattr(exc,'entry_calculation',{})), 'ANOMALY_REPEAT', type(exc).__name__)
+            raise
+        diagnostics.verification_snapshot('REVALIDATED_CALCULATION',repeated or context,'ANOMALY_REPEAT')
         if not repeated or not api.basis.qualifies(repeated) or (repeated['executable_spread_pct'] <= 5 and repeated['raw_spread_pct'] <= 5) or abs(repeated['executable_spread_pct']-item['executable_spread_pct']) > D('0.20') or abs(repeated['raw_spread_pct']-item['raw_spread_pct']) > D('0.20'):
+            diagnostics.verification_rejected(repeated,'ANOMALY_REPEAT')
             raise ValueError('Anomalous spread not confirmed')
         item = repeated
         item['anomaly'] = 'ANOMALOUS_SPREAD_RECONFIRMED'

@@ -482,6 +482,7 @@ def _scan(api):
         if id(item) not in selected:diagnostics.flow('DOWNSTREAM_NOT_SELECTED',item,reason='EXISTING_ALERT_SELECTION_LIMIT')
     for item in alerts:
         diagnostics.flow('DOWNSTREAM_SELECTED_FOR_ALERT',item)
+        diagnostics.verification_snapshot('ORIGINAL_SELECTED_CALCULATION',item)
         key = ('basis', item['symbol'], item['spot'], item['future'])
         try:
             import virtual
