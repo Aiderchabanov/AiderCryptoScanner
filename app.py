@@ -641,6 +641,8 @@ def basis_loop():
                      {k: v.get('ok') for k, v in report.items() if isinstance(v, dict)})
     while True:
         try:
+            import exchange_capital
+            exchange_capital.migrate(exchange_capital.active(current_scanner_api()))
             results = basis.scan(current_scanner_api())
             # basis.scan logs candidates and actually dispatched conditional alerts.
         except Exception:
@@ -671,6 +673,12 @@ def paper_loop():
 @app.get('/healthz')
 def healthz():
     return {'status': 'ok'}, 200
+
+
+@app.get('/paper-capital-status')
+def paper_capital_status():
+    import exchange_capital
+    return exchange_capital.status(exchange_capital.active(current_scanner_api()))
 
 
 @app.get('/')

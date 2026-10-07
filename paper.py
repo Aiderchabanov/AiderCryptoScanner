@@ -258,8 +258,8 @@ def _record(item, path=None, at=None, parent_id=None, connection=None):
             if not budget.is_finite() or budget != __import__('basis').LEG_USDT:
                 entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='PAPER_BUDGET_INVALID')
                 return None
-            addition = virtual.capital(item['spot_cost'],item['future_notional'])
-            if virtual.used(db) + addition > virtual.working_capital_limit():
+            import exchange_capital
+            if not exchange_capital.admits(db, item):
                 entry_policy.reject('REJECTED_MAX_DEPOSIT_LOAD',item,path,db)
                 entry_diagnostics.flow('PAPER_RECORD_BLOCKED',item,reason='MAX_WORKING_CAPITAL')
                 return None

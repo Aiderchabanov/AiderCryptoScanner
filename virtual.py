@@ -326,11 +326,14 @@ def status(api,chat_id,path=None):
 
 
 def close_db(db, e, q):
+    lock(db)
     q=dict(q)
     q['realized_net_pnl_usdt']=realized_result(q)
     result = db.execute("UPDATE virtual_state SET state='closed',closed_at=?,close_json=?,current_json=? WHERE episode_id=? AND state='open'",(q['at'],json.dumps(q),json.dumps(q),e['episode_id']))
     if result.rowcount != 1:
         return False
+    import exchange_capital
+    exchange_capital.closed(db, e, q)
     spread=number(q['spread'])
     converged=abs(spread)<=paper.CLOSED_PCT
     update_metrics(db,e,q,converged)
@@ -759,7 +762,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
         item=verified_entry(api,e)
         with paper.session(path) as db:
             ensure(db)
-            if used(db)+capital(item['spot_cost'],item['future_notional']) > working_capital_limit():
+            if not __import__('exchange_capital').admits(db, item):
                 raise ValueError('50% capital limit')
         q={'spread':str(item['executable_spread_pct']), 'spot_entry':str(item['spot_entry']), 'future_entry':str(item['future_entry']), 'funding':str(item['funding']), 'level':level}
         text=f"Размеры ног: {item['spot_cost']:.4f} / {item['future_notional']:.4f} USDT; комиссии Spot/Futures {item['spot_fee']*100:.4f}% / {item['future_fee']*100:.4f}%; модель net {item['pct']:+.4f}%; защитный резерв 0.20%.\nДополнительный VIRTUAL BUY Spot {q['spot_entry']} + SHORT Futures {q['future_entry']}; funding {D(q['funding'])*100:+.4f}%; spread {D(q['spread']):+.4f}%."
