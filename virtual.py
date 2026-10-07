@@ -607,6 +607,9 @@ def funding_warnings(api,path=None):
             q = funding_snapshot(api,e,path)
             if q is None:
                 continue
+            # Notification only: fresh negative funding; admission/position rules stay unchanged.
+            if number(q['rate']) >= 0 or not 0 <= time.time()-q['at'] <= 30:
+                continue
             key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
             try:
                 pnl = quote(api,e)

@@ -244,17 +244,17 @@ class VirtualTests(unittest.TestCase):
         self.assertIsNone(paper.record(self.item,self.path))
     def test_funding_warning_fresh_books_once_and_restart(self):
         deadline=time.time()+1800
-        self.funding.return_value=(D('.0001'),deadline)
+        self.funding.return_value=(D('-.0001'),deadline)
         self.api.fee.return_value=None # Exit P&L costs do not suppress the funding reminder.
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,1)
         text=self.api.telegram.call_args.args[0]
         self.assertIn('До funding осталось',text)
         self.assertIn('Net P&L сейчас: недоступен',text)
-        self.assertIn('ожидаемый funding: +0.005050 USDT',text)
+        self.assertIn('ожидаемый funding: -0.005050 USDT',text)
         self.assertIn('Решение принимает пользователь',text)
         self.assertIn('Spot Ask: 10.01; Futures Bid: 10.1',text)
-        self.assertIn('Funding: +0.0100%',text)
+        self.assertIn('Funding: -0.0100%',text)
         self.assertIn('до $50',text)
         virtual.bootstrap(self.path)
         virtual.funding_warnings(self.api,self.path)
@@ -263,12 +263,12 @@ class VirtualTests(unittest.TestCase):
         with paper.session(self.path) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_events WHERE state='sent'").fetchone()[0],1)
             self.assertEqual(db.execute('SELECT next_funding_at FROM episodes').fetchone()[0],self.item['next_funding_at'])
-        self.funding.return_value=(D('.0002'),deadline-1)
+        self.funding.return_value=(D('-.0002'),deadline-1)
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,2) # Independent funding event key.
 
     def test_funding_warning_net_pnl_and_percent(self):
-        self.funding.return_value=(D('.0001'),time.time()+1620)
+        self.funding.return_value=(D('-.0001'),time.time()+1620)
         virtual.funding_warnings(self.api,self.path)
         text=self.api.telegram.call_args.args[0]
         self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.1968%',text)
@@ -276,25 +276,25 @@ class VirtualTests(unittest.TestCase):
 
     def test_funding_warning_only_open_and_within_window(self):
         for deadline in (time.time()+1801,time.time()-1):
-            self.funding.return_value=(D('.001'),deadline)
+            self.funding.return_value=(D('-.001'),deadline)
             virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,0)
         with paper.session(self.path) as db:db.execute("UPDATE virtual_state SET state='closed'")
-        self.funding.return_value=(D('.001'),time.time()+1500)
+        self.funding.return_value=(D('-.001'),time.time()+1500)
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,0)
 
     def test_funding_unknown_or_no_fresh_depth_never_notifies(self):
         self.funding.return_value=(None,time.time()+1700)
         virtual.funding_warnings(self.api,self.path)
-        self.funding.return_value=(D('.001'),time.time()+1700)
+        self.funding.return_value=(D('-.001'),time.time()+1700)
         self.api.orderbook.return_value=([['10.01','1']],[['10','1']])
         virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,0)
         with paper.session(self.path) as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_events').fetchone()[0],0)
 
     def test_funding_warning_close_race_skips_send(self):
-        q={'at':time.time(),'next_at':time.time()+1200,'rate':'.0001','spot_ask':'10','future_bid':'10.1','spot_vwap':'10','future_vwap':'10.1','raw_spread':'1','spread':'1'}
+        q={'at':time.time(),'next_at':time.time()+1200,'rate':'-.0001','spot_ask':'10','future_bid':'10.1','spot_vwap':'10','future_vwap':'10.1','raw_spread':'1','spread':'1'}
         def close_during_fetch(*args):
             with paper.session(self.path) as db:db.execute("UPDATE virtual_state SET state='closed'")
             return q
@@ -303,7 +303,7 @@ class VirtualTests(unittest.TestCase):
         self.assertEqual(self.api.telegram.call_count,0)
 
     def test_funding_ambiguous_send_is_not_repeated_after_restart(self):
-        self.funding.return_value=(D('.001'),time.time()+1500)
+        self.funding.return_value=(D('-.001'),time.time()+1500)
         self.api.telegram.side_effect=RuntimeError('network timeout')
         virtual.funding_warnings(self.api,self.path)
         virtual.bootstrap(self.path)
