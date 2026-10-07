@@ -310,11 +310,38 @@ def accounting(path=None, api=None):
             'used_capital':occupied,'capital_limit':limit,'free_capital':max(D(0),limit-occupied)}
 
 
-def status(api,chat_id,path=None):
-    a=accounting(path,api)
+def status_message(api, path=None):
+    """Read-only status projection; migrated accounts are the capital authority."""
+    import exchange_capital
+    a = accounting(path, api)
+    names = exchange_capital.active(api) if hasattr(api, 'credentials_ready') else ()
+    accounts = exchange_capital.status(names, path)['accounts']
     unrealized=(f"{a['unrealized_pnl_open']:+.2f} USDT" if a['unrealized_pnl_open'] is not None
                 else f"UNKNOWN ({a['unrealized_unknown_count']} incomplete; known subtotal {a['known_unrealized_subtotal']:+.2f} USDT)")
-    api.telegram(
+    if accounts:
+        lines = ["📊 VIRTUAL ACCOUNT — PAPER ONLY", "Independent per-exchange accounts"]
+        for row in accounts:
+            lines.extend([
+                f"\n{row['exchange']} ({'ACTIVE' if row['active'] else 'INACTIVE'}):",
+                f"Balance: {D(row['virtual_balance']):.2f} USDT",
+                f"Used: {D(row['used_capital']):.2f} / {D(row['max_allowed_used_capital']):.2f} USDT (50% limit)",
+                f"Free: {D(row['free_capital']):.2f} USDT",
+                f"Available for new legs: {D(row['admission_available_capital']):.2f} USDT",
+                f"Open episodes using exchange: {row['open_episodes_using_exchange']}"])
+        lines.extend([
+            f"\nConfirmed realized P&L (all history): {a['confirmed_realized_pnl']:+.2f} USDT",
+            f"Unrealized P&L open: {unrealized}",
+            f"Open episodes: {a['open_episodes']}",
+            f"Closed complete: {a['closed_complete']} {a['closed_complete_ids']}",
+            f"Closed incomplete: {a['incomplete_closed_pnl_count']} {a['closed_incomplete_ids']}",
+            "Free = balance minus reserved capital. Available for new legs = unused 50% limit.",
+            "Exchange balances include confirmed leg results after migration; earlier P&L remains in historical totals."])
+        return '\n'.join(lines)
+    # Isolated pre-migration SQLite history retains its original display. Never
+    # present a legacy pool as active production capital while migration is pending.
+    if path is None:
+        return "📊 VIRTUAL ACCOUNT — PAPER ONLY\nPer-exchange capital unavailable; account migration not confirmed."
+    return (
         f"📊 VIRTUAL ACCOUNT — PAPER ONLY\nInitial deposit: {a['initial_virtual_deposit']:.2f} USDT\n"
         f"Confirmed realized P&L: {a['confirmed_realized_pnl']:+.2f} USDT\n"
         f"Current virtual balance: {a['current_virtual_balance']:.2f} USDT\n"
@@ -322,7 +349,11 @@ def status(api,chat_id,path=None):
         f"Closed complete: {a['closed_complete']} {a['closed_complete_ids']}\nClosed incomplete: {a['incomplete_closed_pnl_count']} {a['closed_incomplete_ids']}\n"
         f"Used capital: {a['used_capital']:.2f} / {a['capital_limit']:.2f} USDT\n"
         f"Free capital: {a['free_capital']:.2f} USDT\n"
-        "Balance includes confirmed results only; free capital is the unused working limit.",chat_id)
+        "Balance includes confirmed results only; free capital is the unused working limit.")
+
+
+def status(api,chat_id,path=None):
+    api.telegram(status_message(api, path), chat_id)
 
 
 def close_db(db, e, q):
