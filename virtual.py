@@ -10,6 +10,7 @@ import time
 from decimal import Decimal
 import paper
 import entry_diagnostics as diagnostics
+import funding_accounting
 
 D = Decimal
 SCHEMA = '''
@@ -168,7 +169,8 @@ def checked_book(book):
     return asks, bids
 
 
-def quote(api, episode):
+def quote(api, episode, path=None):
+    funding = funding_accounting.snapshot(api, episode, path)
     started = time.monotonic()
     qty = number(episode['quantity'], True)
     snap = json.loads(episode['cost_snapshot_json'])
@@ -205,11 +207,16 @@ def quote(api, episode):
         'spot_exit_usdt':str(max(D(0),qty*spot_bids[0][0]-spot_sale)),
         'futures_exit_usdt':str(max(D(0),cover-qty*future_asks[0][0]))}
 
-    funding_known = time.time() < float(episode['next_funding_at'])
+    # A book request may cross the first settlement boundary. Do not carry the
+    # pre-settlement zero through that boundary into an auto-close decision.
+    if funding['funding_status'] == 'no settlement crossed' and time.time() >= float(episode['next_funding_at']):
+        funding = funding_accounting.unknown('SETTLEMENT_CROSSED_DURING_QUOTE')
+    funding_value = funding['funding_realized_usdt']
+    funding_known = funding_value is not None
     spread = (short / spot_buy - 1) * 100
     return {'spot_pnl':str(spot_pnl),'futures_pnl':str(futures_pnl),
             'funding_rate_at_entry':episode['funding_rate'],
-            'funding_realized_usdt':'0' if funding_known else None,
+            'funding_realized_usdt':funding_value,
             'total_trading_fees':str(fees+spot_entry_fee),
             'fee_breakdown':{'spot_entry':str(spot_entry_fee),'spot_exit':str(spot_exit_fee),'futures_entry':str(futures_entry_fee),'futures_exit':str(futures_exit_fee)},
             'slippage':slippage, 'at':time.time(), 'spread':str(spread), 'spot_bid':str(spot_bids[0][0]),
@@ -223,8 +230,10 @@ def quote(api, episode):
             'raw_spread':str((future_bids[0][0]/spot_asks[0][0]-1)*100),
             'futures_ask':str(future_asks[0][0]), 'spot_exit':str(spot_sale/qty),
             'future_exit':str(cover/qty), 'fees':str(fees), 'trading_net':str(trading_net),
-            'net_pnl':str(trading_net) if funding_known else None,
-            'funding_status':'no settlement crossed' if funding_known else 'UNKNOWN_SETTLEMENT_PNL'}
+            'net_pnl':str(trading_net + number(funding_value)) if funding_known else None,
+            'funding_status':funding['funding_status'],
+            'funding_unknown_reason':funding['funding_unknown_reason'],
+            'funding_settlements_seen':funding['funding_settlements_seen']}
 
 
 def pnl_line(q):
@@ -293,7 +302,7 @@ def accounting(path=None, api=None):
         if api is None:
             unknown+=1;continue
         try:
-            q=quote(api,e)
+            q=quote(api,e,path)
             if time.time()-q['at']>30 or q['net_pnl'] is None:
                 unknown+=1;continue
             unrealized+=number(q['net_pnl'])
@@ -528,7 +537,7 @@ def observe(api, path=None):
         waiting = [dict(r) for r in db.execute("SELECT e.*,v.* FROM episodes e JOIN virtual_state v ON v.episode_id=e.id WHERE v.state='closed' AND NOT EXISTS (SELECT 1 FROM virtual_meta m WHERE m.name='gapreset:' || CAST(e.id AS TEXT)) ORDER BY e.id DESC LIMIT 30").fetchall()]
     for e in waiting:
         try:
-            q = quote(api,e)
+            q = quote(api,e,path)
             if abs(D(q['spread'])) <= paper.CLOSED_PCT:
                 with paper.session(path) as db:
                     db.execute('INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO NOTHING',(f"gapreset:{e['episode_id']}",'1'))
@@ -537,7 +546,7 @@ def observe(api, path=None):
     risk_quotes=[]
     for e in rows(path):
         try:
-            q = quote(api,e)
+            q = quote(api,e,path)
             with paper.session(path) as db:
                 ensure(db); lock(db)
                 current = db.execute('SELECT * FROM virtual_state WHERE episode_id=?',(e['episode_id'],)).fetchone()
@@ -643,7 +652,7 @@ def funding_warnings(api,path=None):
                 continue
             key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
             try:
-                pnl = quote(api,e)
+                pnl = quote(api,e,path)
                 if pnl['net_pnl'] is None:
                     pnl_text = 'Net P&L сейчас: неизвестен; ' + pnl_line(pnl)
                 else:
@@ -769,7 +778,7 @@ def menu(api, action, chat_id,path=None):
     buttons=[]; lines=['PAPER / VIRTUAL ONLY — открытые episodes']
     for e in entries:
         try:
-            q=quote(api,e)
+            q=quote(api,e,path)
             lines.append(f"#{e['episode_id']} {e['symbol']} {e['spot_exchange']}→{e['futures_exchange']}: {pnl_line(q)}")
         except Exception:
             lines.append(f"#{e['episode_id']} {e['symbol']}: свежий P&L недоступен")
@@ -790,7 +799,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
             existing=db.execute('SELECT 1 FROM virtual_meta WHERE name=?',(f'added:{ident}:{level}',)).fetchone()
         if not warning or existing:
             raise ValueError('Expansion level unavailable or already used')
-        live=quote(api,e)
+        live=quote(api,e,path)
         if D(live['spread'])-D(e['executable_spread_pct']) < int(level)*5:
             raise ValueError('Expansion no longer present')
         item=verified_entry(api,e)
@@ -801,7 +810,7 @@ def preview(api,action,ident,chat,user,path=None,level=None):
         q={'spread':str(item['executable_spread_pct']), 'spot_entry':str(item['spot_entry']), 'future_entry':str(item['future_entry']), 'funding':str(item['funding']), 'level':level}
         text=f"Размеры ног: {item['spot_cost']:.4f} / {item['future_notional']:.4f} USDT; комиссии Spot/Futures {item['spot_fee']*100:.4f}% / {item['future_fee']*100:.4f}%; модель net {item['pct']:+.4f}%; защитный резерв 0.20%.\nДополнительный VIRTUAL BUY Spot {q['spot_entry']} + SHORT Futures {q['future_entry']}; funding {D(q['funding'])*100:+.4f}%; spread {D(q['spread']):+.4f}%."
     else:
-        q=quote(api,e)
+        q=quote(api,e,path)
         text=f"Закрытие VIRTUAL #{ident}: Spot SELL {q['spot_exit']}; Futures BUY {q['future_exit']}; комиссии {q['fees']}\n{pnl_line(q)}"
     token=secrets.token_hex(12)
     with paper.session(path) as db:
@@ -821,13 +830,13 @@ def confirm(api,token,chat,user,path=None):
     if not e: raise ValueError('Episode no longer open')
     before=json.loads(proposal['quote_json'])
     if proposal['action']=='add':
-        live=quote(api,e)
+        live=quote(api,e,path)
         if D(live['spread'])-D(e['executable_spread_pct']) < int(before['level'])*5:
             raise ValueError('Expansion no longer present')
         item=verified_entry(api,e)
         spread=item['executable_spread_pct']
     else:
-        q=quote(api,e); spread=D(q['spread'])
+        q=quote(api,e,path); spread=D(q['spread'])
     price_keys = ('spot_entry','future_entry') if proposal['action']=='add' else ('spot_exit','future_exit')
     fresh_prices = item if proposal['action']=='add' else q
     price_changed = any(abs(number(fresh_prices[k],True)/number(before[k],True)-1)>D('0.002') for k in price_keys)
@@ -879,7 +888,7 @@ def handle(api,update,chat_id,path=None):
             if action=='view':
                 e=load(ident,path)
                 if not e: raise ValueError('Episode no longer open')
-                api.telegram(f"VIRTUAL #{ident} {e['symbol']}\n{pnl_line(quote(api,e))}",chat,reply_markup={'inline_keyboard':[[{'text':'Рассчитать закрытие','callback_data':f'close:{ident}'}]]})
+                api.telegram(f"VIRTUAL #{ident} {e['symbol']}\n{pnl_line(quote(api,e,path))}",chat,reply_markup={'inline_keyboard':[[{'text':'Рассчитать закрытие','callback_data':f'close:{ident}'}]]})
             else:
                 preview(api,action,ident,chat,user,path,int(parts[2]) if action=='add' else None)
     except Exception as exc:

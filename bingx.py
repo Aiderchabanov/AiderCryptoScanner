@@ -23,6 +23,7 @@ PATHS = {
     'futures_book': '/openApi/swap/v2/quote/bookTicker',
     'futures_depth': '/openApi/swap/v2/quote/depth',
     'funding': '/openApi/swap/v2/quote/premiumIndex',
+    'funding_history': '/openApi/swap/v2/quote/fundingRate',
     'futures_fee': '/openApi/swap/v2/user/commissionRate',
     'networks': '/openApi/wallets/v1/capital/config/getall',
 }
@@ -86,7 +87,8 @@ class Client:
         if private and not self.credentials_ready:
             raise BingXUnavailable('BingX read-only credentials missing')
         business = dict(params or {})
-        if any(k not in ('symbol', 'coin', 'limit') or not re.fullmatch(r'[A-Za-z0-9_.-]+', str(v))
+        allowed = ('symbol', 'startTime', 'endTime', 'limit') if kind == 'funding_history' else ('symbol', 'coin', 'limit')
+        if any(k not in allowed or not re.fullmatch(r'[A-Za-z0-9_.-]+', str(v))
                for k, v in business.items()):
             raise BingXUnavailable('BingX invalid request parameters')
         with self._lock:
@@ -102,7 +104,7 @@ class Client:
             params = dict(sorted(business.items()))
             headers = {'X-SOURCE-KEY': 'BX-AI-SKILL'}
             # Public queries also signed when read credentials exist. No fallback hosts.
-            if self.credentials_ready:
+            if self.credentials_ready and kind != 'funding_history':
                 canonical = '&'.join(f'{k}={v}' for k, v in params.items())
                 params['signature'] = hmac.new(self.secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
                 headers['X-BX-APIKEY'] = self.key

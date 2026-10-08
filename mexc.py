@@ -19,6 +19,7 @@ PATHS = {'spot_symbols':'/api/v3/exchangeInfo', 'spot_tickers':'/api/v3/ticker/b
          'contracts':'/api/v1/contract/detail/country', 'futures_tickers':'/api/v1/contract/ticker',
          'futures_depth':'/api/v1/contract/depth/{symbol}',
          'funding':'/api/v1/contract/funding_rate/{symbol}',
+         'funding_history':'/api/v1/contract/funding_rate/history',
          'futures_fee':'/api/v1/private/account/tiered_fee_rate/v2'}
 PRIVATE = {'spot_fee','futures_fee'}
 
@@ -71,7 +72,8 @@ class Client:
         if not self.enabled: raise MEXCUnavailable('MEXC disabled')
         if kind in PRIVATE and not self.credentials_ready: raise MEXCUnavailable('MEXC credentials missing')
         business=dict(params or {})
-        if any(k not in ('symbol','limit') or not re.fullmatch(r'[A-Za-z0-9_]+',str(v)) for k,v in business.items()):
+        allowed=('symbol','page_num','page_size') if kind=='funding_history' else ('symbol','limit')
+        if any(k not in allowed or not re.fullmatch(r'[A-Za-z0-9_]+',str(v)) for k,v in business.items()):
             raise MEXCUnavailable('MEXC invalid parameters')
         path=PATHS[kind]
         if '{symbol}' in path:
@@ -98,7 +100,8 @@ class Client:
                     signature=hmac.new(self.secret.encode(),(self.key+stamp+canonical).encode(),hashlib.sha256).hexdigest()
                     headers={'ApiKey':self.key,'Request-Time':stamp,'Signature':signature,'Recv-Window':'10','Language':'en-US'}
             try:
-                r=requests.get(BASE+path,params=business,headers=headers,timeout=10,allow_redirects=False)
+                base='https://contract.mexc.com' if kind=='funding_history' else BASE
+                r=requests.get(base+path,params=business,headers=headers,timeout=10,allow_redirects=False)
                 try: payload=r.json()
                 except ValueError: payload=None
                 code=payload.get('code') if isinstance(payload,dict) else None
@@ -116,7 +119,7 @@ class Client:
                 if r.status_code!=200: raise MEXCUnavailable(f'MEXC {kind} HTTP {r.status_code}')
                 if isinstance(payload,dict) and payload.get('code') not in (None,0):
                     raise MEXCUnavailable(f'MEXC {kind} API rejected request code={safe_code}')
-                if kind.startswith('futures') or kind in ('contracts','funding'):
+                if kind.startswith('futures') or kind in ('contracts','funding','funding_history'):
                     if not isinstance(payload,dict) or payload.get('success') is not True or payload.get('code')!=0:
                         raise MEXCUnavailable('MEXC Futures response UNKNOWN')
                     payload=payload.get('data')
