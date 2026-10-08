@@ -283,6 +283,10 @@ def _record(item, path=None, at=None, parent_id=None, connection=None):
                         'spot_slippage_usdt', 'futures_slippage_usdt',
                         'price_buffer', 'multiplier', 'paper_budget_usdt', 'entry_policy')
         snapshot = {key: str(item[key]) for key in saved_fields if key in item}
+        import paper_funding_model
+        if os.getenv('PAPER_FUNDING_MODE', 'CONFIRMED').upper() == 'ESTIMATED':
+            snapshot['paper_funding_model'] = {'mode': 'ESTIMATED',
+                'method': paper_funding_model.METHOD, 'activated_at': now}
         row = (item['symbol'], item['spot'], item['future'], 'spot_buy/futures_short',
                now, str(budget if budget is not None else item.get('paper_budget_usdt','50')), str(item['spot_cost']), str(item['future_notional']),
                str(item['quantity']), str(item['spot_ask']), str(item['spot_entry']),

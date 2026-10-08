@@ -11,6 +11,7 @@ from decimal import Decimal
 import paper
 import entry_diagnostics as diagnostics
 import funding_accounting
+import paper_funding_model
 
 D = Decimal
 SCHEMA = '''
@@ -35,6 +36,11 @@ CREATE TABLE IF NOT EXISTS virtual_checkpoint_details (
  PRIMARY KEY (episode_id,horizon_min)
 );
 CREATE TABLE IF NOT EXISTS virtual_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS paper_funding_model_events (
+ episode_id BIGINT NOT NULL REFERENCES episodes(id), settlement_ms BIGINT NOT NULL,
+ status TEXT NOT NULL, payload_json TEXT NOT NULL, received_at DOUBLE PRECISION NOT NULL,
+ PRIMARY KEY (episode_id,settlement_ms)
+);
 CREATE TABLE IF NOT EXISTS virtual_metrics (
  episode_id BIGINT PRIMARY KEY REFERENCES episodes(id),
  tracking_started_at DOUBLE PRECISION NOT NULL, max_spread TEXT NOT NULL,
@@ -170,7 +176,9 @@ def checked_book(book):
 
 
 def quote(api, episode, path=None):
-    funding = funding_accounting.snapshot(api, episode, path)
+    model = paper_funding_model.enabled(episode)
+    funding = (paper_funding_model.snapshot(api, episode, path) if model
+               else funding_accounting.snapshot(api, episode, path))
     started = time.monotonic()
     qty = number(episode['quantity'], True)
     snap = json.loads(episode['cost_snapshot_json'])
@@ -214,7 +222,7 @@ def quote(api, episode, path=None):
     funding_value = funding['funding_realized_usdt']
     funding_known = funding_value is not None
     spread = (short / spot_buy - 1) * 100
-    return {'spot_pnl':str(spot_pnl),'futures_pnl':str(futures_pnl),
+    result = {'spot_pnl':str(spot_pnl),'futures_pnl':str(futures_pnl),
             'funding_rate_at_entry':episode['funding_rate'],
             'funding_realized_usdt':funding_value,
             'total_trading_fees':str(fees+spot_entry_fee),
@@ -234,9 +242,21 @@ def quote(api, episode, path=None):
             'funding_status':funding['funding_status'],
             'funding_unknown_reason':funding['funding_unknown_reason'],
             'funding_settlements_seen':funding['funding_settlements_seen']}
+    if model:
+        value = funding.get('model_funding_pnl_usdt')
+        result.update(funding_mode='ESTIMATED', model_method=paper_funding_model.METHOD,
+                      model_funding_pnl_usdt=value,
+                      model_net_pnl_usdt=str(trading_net + number(value)) if value is not None else None,
+                      model_valid_until=funding.get('model_valid_until'))
+    return result
 
 
 def pnl_line(q):
+    if q.get('funding_mode') == 'ESTIMATED':
+        value = q.get('model_net_pnl_usdt')
+        shown = f"{number(value):+.4f} USDT" if value is not None else 'UNKNOWN'
+        return (f"Spread {D(q['spread']):+.4f}%; Funding: {q['funding_status']}\n"
+                f"Model Net P&L: {shown}\nМодельная прибыль/убыток PAPER. Не подтверждённое начисление биржи")
     suffix = '' if q['net_pnl'] is not None else '; funding не подтверждён, полный Net P&L неизвестен'
     return f"Spread {D(q['spread']):+.4f}%; торговый Net P&L {D(q['trading_net']):+.4f} USDT{suffix}"
 
@@ -367,8 +387,13 @@ def status(api,chat_id,path=None):
 
 def close_db(db, e, q):
     lock(db)
+    model_net = paper_funding_model.closing_net(e,q) if paper_funding_model.enabled(e) else None
+    if paper_funding_model.enabled(e) and model_net is None:
+        return False
     q=dict(q)
     q['realized_net_pnl_usdt']=realized_result(q)
+    if paper_funding_model.enabled(e):
+        q['model_realized_net_pnl_usdt'] = str(model_net)
     result = db.execute("UPDATE virtual_state SET state='closed',closed_at=?,close_json=?,current_json=? WHERE episode_id=? AND state='open'",(q['at'],json.dumps(q),json.dumps(q),e['episode_id']))
     if result.rowcount != 1:
         return False
@@ -456,7 +481,7 @@ def risk_alert(db, e, q):
     spread_notified.update(crossed_spread)
     state['spread_notified']=sorted(spread_notified)
     thresholds=(D('-.20'),D('-.50'),D('-1.00'))
-    net=number(q['net_pnl']) if q.get('net_pnl') is not None else None
+    net=paper_funding_model.closing_net(e,q)
     # Migrate existing levels as already notified; restart cannot reintroduce them.
     notified=set(state.get('pnl_notified', [str(level) for level in thresholds[:state['pnl_warning_level']]]))
     previous_net=number(state['last_known_net_pnl']) if state.get('last_known_net_pnl') is not None else None
@@ -568,10 +593,14 @@ def observe(api, path=None):
                     episode22_diagnostics.emit(e,q,'observation',funding=diagnostic_funding)
                 update_metrics(db,e,q,converged)
                 if converged:
-                    if q['net_pnl'] is not None and number(q['net_pnl'])>=0:
+                    close_net = paper_funding_model.closing_net(e, q)
+                    if close_net is not None and close_net>=0:
                         close_db(db,e,q)
                         continue
-                    reason='CONVERGED_BUT_NET_NEGATIVE' if q['net_pnl'] is not None else 'UNKNOWN_SETTLEMENT_PNL'
+                    if paper_funding_model.enabled(e):
+                        reason='CONVERGED_BUT_MODEL_NET_NEGATIVE' if close_net is not None else 'UNKNOWN_MODEL_NET_PNL'
+                    else:
+                        reason='CONVERGED_BUT_NET_NEGATIVE' if q['net_pnl'] is not None else 'UNKNOWN_SETTLEMENT_PNL'
                     q['auto_close_blocked_reason']=reason
                     db.execute('UPDATE virtual_state SET current_json=? WHERE episode_id=?',(json.dumps(q),e['episode_id']))
                     db.execute("INSERT INTO virtual_meta (name,value) VALUES (?,?) ON CONFLICT (name) DO UPDATE SET value=excluded.value",(f'auto_close_reason:{e["episode_id"]}',reason))
@@ -653,7 +682,9 @@ def funding_warnings(api,path=None):
             key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
             try:
                 pnl = quote(api,e,path)
-                if pnl['net_pnl'] is None:
+                if pnl.get('funding_mode') == 'ESTIMATED':
+                    pnl_text = pnl_line(pnl)
+                elif pnl['net_pnl'] is None:
                     pnl_text = 'Net P&L сейчас: неизвестен; ' + pnl_line(pnl)
                 else:
                     capital = number(e['used_capital'],True)
