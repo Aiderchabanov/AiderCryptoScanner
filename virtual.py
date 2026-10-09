@@ -625,7 +625,7 @@ def observe(api, path=None):
             bxdiag.emit(exc,e['episode_id'],e['symbol'],'observation')
             logging.warning('Virtual observation #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
     funding_warnings(api,path)
-    # Reuse funding already refreshed by the existing warning worker; no new GET.
+    # Reuse funding refreshed for risk context only; no standalone funding alerts.
     for e,q in risk_quotes:
         try:
             with paper.session(path) as db:
@@ -670,73 +670,23 @@ def funding_snapshot(api, e, path=None):
 
 
 def funding_warnings(api,path=None):
+    """Refresh existing risk context only; standalone funding Telegram is disabled."""
     for e in rows(path):
         try:
-            # Schedule is refreshed independently of exit P&L/fee availability.
-            q = funding_snapshot(api,e,path)
-            if q is None:
-                continue
-            # Notification only: fresh negative funding; admission/position rules stay unchanged.
-            if number(q['rate']) >= 0 or not 0 <= time.time()-q['at'] <= 30:
-                continue
-            key = f"funding:{e['episode_id']}:{round(q['next_at']*1000)}"
-            try:
-                pnl = quote(api,e,path)
-                if pnl.get('funding_mode') == 'ESTIMATED':
-                    pnl_text = pnl_line(pnl)
-                elif pnl['net_pnl'] is None:
-                    pnl_text = 'Net P&L сейчас: неизвестен; ' + pnl_line(pnl)
-                else:
-                    capital = number(e['used_capital'],True)
-                    net = number(pnl['net_pnl'])
-                    pnl_text = f'Net P&L сейчас: {net:+.4f} USDT ({net/capital*100:+.4f}% от виртуального капитала episode)'
-            except Exception:
-                pnl_text = 'Net P&L сейчас: недоступен — свежие цены закрытия или комиссии не подтверждены'
-            remaining = int(q['next_at']-time.time())
-            if not 0 < remaining <= 1800 or not 0 <= time.time()-q['at'] <= 30:
-                continue
-            body = (f"⚠️ До funding осталось {remaining//60} мин {remaining%60} сек\nEpisode #{e['episode_id']}\n"
-                    f"Монета: {e['symbol'][:-4]}/USDT\nSpot: {e['spot_exchange']}\nFutures: {e['futures_exchange']}\n"
-                    f"Входной спред по стакану: {D(e['executable_spread_pct']):+.4f}%\n"
-                    f"Текущий спред Ask/Bid: {D(q['raw_spread']):+.4f}%; по стакану: {D(q['spread']):+.4f}%\n"
-                    f"Spot Ask: {q['spot_ask']}; Futures Bid: {q['future_bid']}\n"
-                    f"Исполнимые цены по стакану до $50 на ногу: Spot {q['spot_vwap']}; Futures {q['future_vwap']}\n"
-                    + pnl_text + '\n'
-                    + f"Funding: {D(q['rate'])*100:+.4f}%\n"
-                    f"Следующий funding: {time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(q['next_at']))}\n"
-                    f"Осталось: {remaining//60} мин {remaining%60} сек\n"
-                    + (f"Если оставить сделку открытой до funding, ожидаемый funding: {D(q['expected_funding']):+.6f} USDT\n" if q.get('expected_funding') is not None else "Ожидаемый funding: неизвестен\n")
-                    + "Оценка по текущему исполнимому Futures Bid и ставке; фактическое начисление зависит от mark price и ставки в момент funding.\n"
-                    "Решение принимает пользователь.\n⏳ Виртуальная сделка всё ещё открыта.\n🟡 PAPER / VIRTUAL ONLY")
-            # Commit the unique claim BEFORE HTTP so restart cannot resend it.
-            with paper.session(path) as db:
-                ensure(db);lock(db)
-                current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(e['episode_id'],)).fetchone()
-                if not current or current['state']!='open':
-                    continue
-                result=db.execute("INSERT INTO virtual_events (event_key,episode_id,body,state) VALUES (?,?,?,'claimed') ON CONFLICT (event_key) DO NOTHING",(key,e['episode_id'],body))
-                if result.rowcount!=1:
-                    continue
-            with paper.session(path) as db:
-                ensure(db);lock(db)
-                current=db.execute('SELECT state FROM virtual_state WHERE episode_id=?',(e['episode_id'],)).fetchone()
-                # Lock spans Telegram HTTP: a concurrent close cannot race this send.
-                if not current or current['state']!='open' or not 0 <= time.time()-q['at'] <= 30 or not 0 < q['next_at']-time.time() <= 1800:
-                    db.execute("UPDATE virtual_events SET state='cancelled' WHERE event_key=?",(key,))
-                    continue
-                api.telegram(body)
-                db.execute("UPDATE virtual_events SET state='sent' WHERE event_key=?",(key,))
-                db.execute('UPDATE virtual_state SET last_notice_spread=? WHERE episode_id=?',(q['spread'],e['episode_id']))
-            logging.info('Virtual funding warning sent: episode #%s, funding event %s',e['episode_id'],int(q['next_at']))
+            # Keep the existing read-only refresh used by spread/risk alerts.
+            # No funding notification body, delivery claim, or Telegram send.
+            funding_snapshot(api,e,path)
         except Exception as exc:
-            bxdiag.emit(exc,e['episode_id'],e['symbol'],'funding_warning')
-            logging.warning('Virtual funding warning #%s unavailable or delivery uncertain (%s)',e['episode_id'],type(exc).__name__)
+            bxdiag.emit(exc,e['episode_id'],e['symbol'],'funding_refresh')
+            logging.warning('Virtual funding context #%s unavailable (%s)',e['episode_id'],type(exc).__name__)
 
 
 def dispatch(api,path=None):
     # At-most-once delivery: claim before HTTP. Uncertain sends are not retried.
     with paper.session(path) as db:
         ensure(db); lock(db)
+        # Retire queued funding-only reminders without touching trade events/history.
+        db.execute("UPDATE virtual_events SET state='cancelled' WHERE state='pending' AND event_key LIKE 'funding:%'")
         pending = db.execute("SELECT * FROM virtual_events WHERE state='pending' ORDER BY event_key LIMIT 30").fetchall()
         for row in pending:
             db.execute("UPDATE virtual_events SET state='claimed' WHERE event_key=?",(row['event_key'],))

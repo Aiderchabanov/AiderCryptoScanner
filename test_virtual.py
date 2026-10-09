@@ -242,37 +242,24 @@ class VirtualTests(unittest.TestCase):
         self.assertIsNone(paper.record(self.item,self.path))
         self.assertIsNotNone(paper.record(self.item,self.path,parent_id=self.ident))
         self.assertIsNone(paper.record(self.item,self.path))
-    def test_funding_warning_fresh_books_once_and_restart(self):
-        deadline=time.time()+1800
-        self.funding.return_value=(D('-.0001'),deadline)
-        self.api.fee.return_value=None # Exit P&L costs do not suppress the funding reminder.
+    def test_funding_warning_disabled_with_fresh_books_and_restart(self):
+        self.funding.return_value=(D('-.0001'),time.time()+1700)
         virtual.funding_warnings(self.api,self.path)
-        self.assertEqual(self.api.telegram.call_count,1)
-        text=self.api.telegram.call_args.args[0]
-        self.assertIn('До funding осталось',text)
-        self.assertIn('Net P&L сейчас: недоступен',text)
-        self.assertIn('ожидаемый funding: -0.005050 USDT',text)
-        self.assertIn('Решение принимает пользователь',text)
-        self.assertIn('Spot Ask: 10.01; Futures Bid: 10.1',text)
-        self.assertIn('Funding: -0.0100%',text)
-        self.assertIn('до $50',text)
         virtual.bootstrap(self.path)
         virtual.funding_warnings(self.api,self.path)
-        self.assertEqual(self.api.telegram.call_count,1)
+        self.api.telegram.assert_not_called()
         self.assertEqual(self.state()['state'],'open')
         with paper.session(self.path) as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_events WHERE state='sent'").fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM virtual_events WHERE event_key LIKE 'funding:%'").fetchone()[0],0)
             self.assertEqual(db.execute('SELECT next_funding_at FROM episodes').fetchone()[0],self.item['next_funding_at'])
-        self.funding.return_value=(D('-.0002'),deadline-1)
-        virtual.funding_warnings(self.api,self.path)
-        self.assertEqual(self.api.telegram.call_count,2) # Independent funding event key.
+            self.assertIsNotNone(db.execute("SELECT value FROM virtual_meta WHERE name=?",(f'funding_live:{self.ident}',)).fetchone())
 
-    def test_funding_warning_net_pnl_and_percent(self):
+    def test_funding_warning_does_not_fetch_pnl_for_telegram(self):
         self.funding.return_value=(D('-.0001'),time.time()+1620)
-        virtual.funding_warnings(self.api,self.path)
-        text=self.api.telegram.call_args.args[0]
-        self.assertIn('Net P&L сейчас: +0.1986 USDT (+0.1968%',text)
-        self.assertIn('виртуального капитала episode',text)
+        with patch.object(virtual,'quote') as quote:
+            virtual.funding_warnings(self.api,self.path)
+        quote.assert_not_called()
+        self.api.telegram.assert_not_called()
 
     def test_funding_warning_only_open_and_within_window(self):
         for deadline in (time.time()+1801,time.time()-1):
@@ -302,14 +289,15 @@ class VirtualTests(unittest.TestCase):
             virtual.funding_warnings(self.api,self.path)
         self.assertEqual(self.api.telegram.call_count,0)
 
-    def test_funding_ambiguous_send_is_not_repeated_after_restart(self):
+    def test_funding_disabled_never_calls_sender_even_after_restart(self):
         self.funding.return_value=(D('-.001'),time.time()+1500)
         self.api.telegram.side_effect=RuntimeError('network timeout')
         virtual.funding_warnings(self.api,self.path)
         virtual.bootstrap(self.path)
         virtual.funding_warnings(self.api,self.path)
-        self.assertEqual(self.api.telegram.call_count,1)
-        with paper.session(self.path) as db:self.assertEqual(db.execute('SELECT state FROM virtual_events').fetchone()[0],'claimed')
+        self.api.telegram.assert_not_called()
+        with paper.session(self.path) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM virtual_events').fetchone()[0],0)
 
     def test_leg_pnl_fees_slippage_saved_without_double_count(self):
         q=virtual.quote(self.api,virtual.load(self.ident,self.path))
