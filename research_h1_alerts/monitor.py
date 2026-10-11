@@ -154,10 +154,10 @@ def load_state():
         obj=json.loads(p.read_text())
     else:
         raw=issue_api("GET").get("body", "")
-        prefix="<!-- " + STATE_MARKER + "\\n"
-        if not raw.startswith(prefix) or "\\n-->" not in raw:
+        prefix="<!-- " + STATE_MARKER + "\n"
+        if not raw.startswith(prefix) or "\n-->" not in raw:
             raise RuntimeError("Malformed GitHub state marker: fail closed")
-        obj=json.loads(raw[len(prefix):raw.index("\\n-->")])
+        obj=json.loads(raw[len(prefix):raw.index("\n-->")])
     if not isinstance(obj.get("sent_ids"),list) or any(not isinstance(x,str) for x in obj["sent_ids"]):
         raise RuntimeError("Malformed state IDs: fail closed")
     return set(obj["sent_ids"])
@@ -170,7 +170,7 @@ def persist(ids):
         tmp.write_text(json.dumps({"sent_ids":sorted(ids)},sort_keys=True))
         os.replace(tmp,p)
         return
-    body="<!-- " + STATE_MARKER + "\\n" + json.dumps({"sent_ids":sorted(ids)},sort_keys=True) + "\\n-->\\n\\nResearch-only notification IDs. No secrets. Do not edit."
+    body="<!-- " + STATE_MARKER + "\n" + json.dumps({"sent_ids":sorted(ids)},sort_keys=True) + "\n-->\n\nResearch-only notification IDs. No secrets. Do not edit."
     issue_api("PATCH",{"body":body})
 
 
