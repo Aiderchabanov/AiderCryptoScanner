@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,9 +81,11 @@ def candidates(symbol, bars):
     out = []
     last = len(bars)-1
     for direction in ("up", "down"):
-        e = [x for x in ev if x["dir"] == direction and x["bar"] >= last-12]
+        # Fresh signal only: second break must be on the last closed H1 candle.
+        e = [x for x in ev if x["dir"] == direction and x["bar"] >= last-24]
         for k, first in enumerate(e):
-            second = next((z for z in e[k+1:] if z["bar"] > first["bar"] and
+            second = next((z for z in e[k+1:] if z["bar"] == last and z["bar"] > first["bar"] and
+                           (z["p"] > first["p"] if direction == "up" else z["p"] < first["p"]) and
                            abs(z["p"]-first["p"]) >= 0.25*av[z["bar"]-1]), None)
             if second is None:
                 continue
@@ -153,7 +154,10 @@ def scan_once():
     info=api("/exchangeInfo")
     active={x["symbol"] for x in info["symbols"] if x["quoteAsset"]=="USDT"
             and x["status"]=="TRADING" and x.get("isSpotTradingAllowed",False)}
+    # Fail closed before any market requests capable of triggering messages.
     sent=set() if DRY_RUN else load_state()
+    if not DRY_RUN and (not TOKEN or not CHAT):
+        raise RuntimeError("Telegram configuration unavailable; no sends")
     for root in SYMBOLS:
         symbol=root+"USDT"
         if symbol not in active:
@@ -163,6 +167,11 @@ def scan_once():
             data=api("/klines",symbol=symbol,interval="1h",limit=300)
             bars=[{"t":x[0],"o":float(x[1]),"h":float(x[2]),"l":float(x[3]),
                    "c":float(x[4]),"close":x[6]} for x in data if x[6] < now]
+            if any(b["h"] < max(b["o"],b["c"],b["l"]) or b["l"] > min(b["o"],b["c"],b["h"]) or
+                   b["t"]+3599999 != b["close"] for b in bars) or any(
+                       bars[i]["t"]-bars[i-1]["t"]!=3600000 for i in range(1,len(bars))):
+                LOG.warning("%s INVALID_OHLCV_OR_GAP",symbol)
+                continue
             if not bars or now-bars[-1]["close"] > 2*3600*1000:
                 LOG.warning("%s STALE_DATA",symbol)
                 continue
@@ -194,7 +203,8 @@ def scan_once():
                 LOG.info("Telegram delivery accepted: %s %s",symbol,c["id"])
         except (ValueError,KeyError,requests.RequestException,RuntimeError) as exc:
             LOG.error("%s scan failure: %s",symbol,type(exc).__name__)
-            # A Binance rate/geo block is not retried here.
+            if isinstance(exc, RuntimeError) and "Binance HTTP " in str(exc):
+                raise  # stop scan on rate/geo restriction
     return 0
 
 
