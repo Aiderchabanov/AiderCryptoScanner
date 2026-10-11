@@ -13,6 +13,10 @@ BASE = "https://data-api.binance.vision/api/v3"
 TG = "https://api.telegram.org"
 SYMBOLS = """AAVE ADA APT ARB AVAX BCH BNB BTC DOGE DOT ETH FET FIL HBAR ICP INJ LINK LTC NEAR ONDO RENDER SOL SUI TRX UNI WLD XLM XRP ATOM ALGO ETC OP SEI TIA PEPE SHIB TON ENA JUP WIF BONK PENDLE CRV GRT SAND AXS LDO RUNE KAS ZEC""".split()
 STATE = os.environ.get("RESEARCH_STATE_FILE", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+STATE_ISSUE = os.environ.get("H1_RESEARCH_STATE_ISSUE", "")
+STATE_MARKER = "H1_RESEARCH_STATE_V1"
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 DRY_RUN = "--dry-run" in sys.argv
@@ -127,23 +131,47 @@ def candidates(symbol, bars):
     return list(unique.values())
 
 
+def issue_api(method, payload=None):
+    """Persistent notification hash store in a dedicated GitHub issue."""
+    if not GITHUB_TOKEN or GITHUB_REPOSITORY != "Aiderchabanov/AiderCryptoScanner" or STATE_ISSUE != "4":
+        raise RuntimeError("Research state authorization unavailable; fail closed")
+    url = "https://api.github.com/repos/" + GITHUB_REPOSITORY + "/issues/" + STATE_ISSUE
+    response = requests.request(method, url, headers={
+        "Authorization": "Bearer " + GITHUB_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }, json=payload, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
 def load_state():
-    if not STATE:
-        raise RuntimeError("RESEARCH_STATE_FILE not set: durable dedup state required")
-    p=Path(STATE)
-    if not p.is_file():
-        raise RuntimeError("Durable state file absent; initialize separately before enabling Telegram")
-    obj=json.loads(p.read_text())
-    if not isinstance(obj.get("sent_ids"), list):
-        raise RuntimeError("Malformed state file: fail closed")
+    if STATE:
+        # Local durable file mode (independent installation only).
+        p=Path(STATE)
+        if not p.is_file():
+            raise RuntimeError("Durable state file absent: fail closed")
+        obj=json.loads(p.read_text())
+    else:
+        raw=issue_api("GET").get("body", "")
+        prefix="<!-- " + STATE_MARKER + "\\n"
+        if not raw.startswith(prefix) or "\\n-->" not in raw:
+            raise RuntimeError("Malformed GitHub state marker: fail closed")
+        obj=json.loads(raw[len(prefix):raw.index("\\n-->")])
+    if not isinstance(obj.get("sent_ids"),list) or any(not isinstance(x,str) for x in obj["sent_ids"]):
+        raise RuntimeError("Malformed state IDs: fail closed")
     return set(obj["sent_ids"])
 
 
 def persist(ids):
-    p=Path(STATE)
-    tmp=p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"sent_ids":sorted(ids)},sort_keys=True))
-    os.replace(tmp,p)
+    if STATE:
+        p=Path(STATE)
+        tmp=p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"sent_ids":sorted(ids)},sort_keys=True))
+        os.replace(tmp,p)
+        return
+    body="<!-- " + STATE_MARKER + "\\n" + json.dumps({"sent_ids":sorted(ids)},sort_keys=True) + "\\n-->\\n\\nResearch-only notification IDs. No secrets. Do not edit."
+    issue_api("PATCH",{"body":body})
 
 
 def message(c, latest_quote):
