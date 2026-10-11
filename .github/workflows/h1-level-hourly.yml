@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   scan:
-    # Fail closed until durable dedup storage and bot credentials are configured and verified.
-    if: ${{ vars.ENABLE_H1_RESEARCH_ALERTS == 'true' }}
+    # Every hour, silently check; send only on new qualified signals.
+    # Research script fails closed if secrets/state are inaccessible.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
