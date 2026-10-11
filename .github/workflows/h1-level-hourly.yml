@@ -1,0 +1,40 @@
+name: Research H1 two-level breakout watcher
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: research-h1-level-watcher
+  cancel-in-progress: false
+jobs:
+  scan:
+    # Fail closed until durable dedup storage and bot credentials are configured and verified.
+    if: ${{ vars.ENABLE_H1_RESEARCH_ALERTS == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout isolated research branch only
+        uses: actions/checkout@v4
+        with:
+          ref: research/h1-level-alerts-isolated-20261011
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests==2.32.5
+      - name: Verify durable state mount is available
+        run: |
+          if [ ! -f "$RESEARCH_STATE_FILE" ]; then
+            echo "H1 research alerting disabled: durable dedup state unavailable"
+            exit 1
+          fi
+        env:
+          RESEARCH_STATE_FILE: ${{ vars.RESEARCH_STATE_FILE }}
+      - name: Scan official Binance Spot H1 and notify only on new qualified breakouts
+        run: python research_h1_alerts/monitor.py
+        env:
+          RESEARCH_STATE_FILE: ${{ vars.RESEARCH_STATE_FILE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
