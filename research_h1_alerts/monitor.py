@@ -106,6 +106,7 @@ def candidates(symbol, bars):
                 continue
             payload = {"pair":symbol, "direction":direction, "levels":[first["p"],second["p"]],
                        "level2_utc":utc(bars[second["bar"]]["t"]),
+                       "wave_start_utc":utc(bars[first["bar"]]["t"]),
                        "close_utc":utc(bars[last]["close"]),
                        "close":bars[last]["c"], "boundary":boundary}
             payload["id"] = hashlib.sha256(json.dumps(
@@ -116,12 +117,12 @@ def candidates(symbol, bars):
     # multiple older first-level anchors creating duplicate Telegram notices.
     unique = {}
     for item in out:
-        key = (item["pair"], item["direction"], item["level2_utc"])
+        key = (item["pair"], item["direction"], item["wave_start_utc"])
         if key not in unique or (item["direction"]=="up" and item["levels"][0] < unique[key]["levels"][0]) or (item["direction"]=="down" and item["levels"][0] > unique[key]["levels"][0]):
             unique[key] = item
     for item in unique.values():
         item["id"] = hashlib.sha256(json.dumps(
-            [item["pair"],item["direction"],item["level2_utc"]],
+            [item["pair"],item["direction"],item["wave_start_utc"]],
             separators=(",",":")).encode()).hexdigest()[:24]
     return list(unique.values())
 
