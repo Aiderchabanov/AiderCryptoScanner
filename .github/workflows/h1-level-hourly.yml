@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  issues: write
 concurrency:
   group: research-h1-level-watcher
   cancel-in-progress: false
@@ -24,17 +25,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests==2.32.5
-      - name: Verify durable state mount is available
-        run: |
-          if [ ! -f "$RESEARCH_STATE_FILE" ]; then
-            echo "H1 research alerting disabled: durable dedup state unavailable"
-            exit 1
-          fi
-        env:
-          RESEARCH_STATE_FILE: ${{ vars.RESEARCH_STATE_FILE }}
       - name: Scan official Binance Spot H1 and notify only on new qualified breakouts
         run: python research_h1_alerts/monitor.py
         env:
-          RESEARCH_STATE_FILE: ${{ vars.RESEARCH_STATE_FILE }}
+          GITHUB_TOKEN: ${{ github.token }}
+          H1_RESEARCH_STATE_ISSUE: '4'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
