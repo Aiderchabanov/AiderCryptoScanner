@@ -112,7 +112,18 @@ def candidates(symbol, bars):
                 [symbol,direction,first["p"],second["p"],bars[second["bar"]]["t"]],
                 separators=(",",":")).encode()).hexdigest()[:24]
             out.append(payload)
-    return out
+    # At most one alert per direction and last H1 confirmation; prevent
+    # multiple older first-level anchors creating duplicate Telegram notices.
+    unique = {}
+    for item in out:
+        key = (item["pair"], item["direction"], item["level2_utc"])
+        if key not in unique or (item["direction"]=="up" and item["levels"][0] < unique[key]["levels"][0]) or (item["direction"]=="down" and item["levels"][0] > unique[key]["levels"][0]):
+            unique[key] = item
+    for item in unique.values():
+        item["id"] = hashlib.sha256(json.dumps(
+            [item["pair"],item["direction"],item["level2_utc"]],
+            separators=(",",":")).encode()).hexdigest()[:24]
+    return list(unique.values())
 
 
 def load_state():
