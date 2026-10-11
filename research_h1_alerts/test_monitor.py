@@ -62,7 +62,7 @@ class H1Tests(unittest.TestCase):
 
     def test_github_issue_state_loaded(self):
         with patch.object(m,"STATE",""),patch.object(m,"issue_api",return_value={
-            "body": '<!-- H1_RESEARCH_STATE_V1\\n{"sent_ids":["existing"]}\\n-->'
+            "body": chr(10).join(["<!-- H1_RESEARCH_STATE_V1", '{"sent_ids":["existing"]}', "-->"])
         }):
             self.assertEqual(m.load_state(),{"existing"})
 
