@@ -60,6 +60,24 @@ class H1Tests(unittest.TestCase):
         with patch.object(m,"atr14",return_value=[1.0]*len(b)):
             self.assertEqual(m.candidates("BTCUSDT",b),[])
 
+    def test_github_issue_state_loaded(self):
+        with patch.object(m,"STATE",""),patch.object(m,"issue_api",return_value={
+            "body": '<!-- H1_RESEARCH_STATE_V1\\n{"sent_ids":["existing"]}\\n-->'
+        }):
+            self.assertEqual(m.load_state(),{"existing"})
+
+    def test_github_issue_state_malformed_fails_closed(self):
+        with patch.object(m,"STATE",""),patch.object(m,"issue_api",return_value={"body":"wrong"}):
+            with self.assertRaises(RuntimeError):
+                m.load_state()
+
+    def test_github_issue_state_persist(self):
+        with patch.object(m,"STATE",""),patch.object(m,"issue_api") as api:
+            m.persist({"xyz","abc"})
+            api.assert_called_once()
+            self.assertEqual(api.call_args.args[0],"PATCH")
+            self.assertIn('"sent_ids": ["abc", "xyz"]',api.call_args.args[1]["body"])
+
     def test_telegram_not_called_without_credentials(self):
         with patch.object(m,"DRY_RUN",False),patch.object(m,"STATE","/nonexistent/file.json"),patch.object(m.requests,"post") as post:
             with self.assertRaises(RuntimeError):
